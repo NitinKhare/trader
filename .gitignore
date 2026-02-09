@@ -1,0 +1,54 @@
+# Go
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+*.egg
+dist/
+build/
+
+# AI outputs (generated, not committed)
+/ai_outputs/
+
+# Market data (large files, not committed)
+/market_data/
+
+# Logs
+/logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+credentials.json
+
+# Config with secrets (use config.json.example as template)
+config/config.json
+
+# Database
+*.db
+*.sqlite
