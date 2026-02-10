@@ -60,7 +60,13 @@ docker exec algo_trading_db psql -U algo -d algo_trading -f /tmp/schema.sql
 
 ### 4. Configure Dhan API credentials
 
-Edit `config/config.json` and fill in your Dhan API credentials:
+Copy the example config and fill in your Dhan API credentials:
+
+```bash
+cp config/config.json.example config/config.json
+```
+
+Then edit `config/config.json`:
 
 ```json
 {
@@ -199,7 +205,8 @@ Covers: strategies, risk rules, broker (paper), config validation, market calend
   run_scoring.py          Nightly scoring pipeline entry point
 /db/migrations/           SQL schema (Postgres + TimescaleDB)
 /config/
-  config.json             System configuration
+  config.json.example     Config template (copy to config.json)
+  config.json             System configuration (git-ignored, contains secrets)
   holidays_2026.json      NSE exchange holidays
   stock_universe.json     NIFTY 50 stock list
   dhan_instruments.json   Ticker → Dhan securityId mapping
@@ -258,4 +265,4 @@ Dhan API ──> Go DhanDataProvider ──> CSV files (market_data/)
 - Max 90 days per request (auto-chunked)
 - Access tokens expire every 24 hours — refresh at [web.dhan.co](https://web.dhan.co)
 - Postback URL available for order status webhooks (configured in Dhan dashboard)
-# trader
+- Data API subscription required (Rs 499/month) — subscribe at Profile → DhanHQ Trading APIs

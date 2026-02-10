@@ -322,7 +322,7 @@ func TestDhanData_ExportCSV_MergesExistingData(t *testing.T) {
 
 	// Read back and verify: should have 3 unique dates.
 	csvPath := filepath.Join(tmpDir, "market_data", "TEST.csv")
-	candles := loadExistingCSV(csvPath)
+	candles := LoadExistingCSV(csvPath)
 	if len(candles) != 3 {
 		t.Errorf("expected 3 merged candles, got %d", len(candles))
 	}

@@ -45,8 +45,10 @@ type StockScore struct {
 	TrendStrengthScore  float64 `json:"trend_strength_score"`  // 0–1
 	BreakoutQualityScore float64 `json:"breakout_quality_score"` // 0–1
 	VolatilityScore     float64 `json:"volatility_score"`      // 0–1
-	RiskScore           float64 `json:"risk_score"`            // 0–1
-	LiquidityScore      float64 `json:"liquidity_score"`       // 0–1
+	RiskScore            float64 `json:"risk_score"`             // 0–1
+	LiquidityScore       float64 `json:"liquidity_score"`       // 0–1
+	CompositeScore       float64 `json:"composite_score"`       // 0–1, weighted combination
+	Rank                 int     `json:"rank"`                  // 1-based rank (1 = best)
 }
 
 // Candle represents a single OHLCV bar.

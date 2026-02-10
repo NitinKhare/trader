@@ -265,4 +265,8 @@ def save_scores(scores_df: pd.DataFrame, output_dir: str, scoring_date: date) ->
     output_path = os.path.join(date_dir, "stock_scores.parquet")
     scores_df.to_parquet(output_path, index=False)
 
+    # Also save as JSON for Go engine consumption (Go can't read Parquet natively).
+    json_path = os.path.join(date_dir, "stock_scores.json")
+    scores_df.to_json(json_path, orient="records", indent=2)
+
     return output_path

@@ -34,8 +34,8 @@ const (
 	// dhanMaxChunkDays is the maximum number of days Dhan allows per historical data request.
 	dhanMaxChunkDays = 90
 
-	// dhanRateLimitInterval is the minimum time between API requests (10 req/sec).
-	dhanRateLimitInterval = 110 * time.Millisecond
+	// dhanRateLimitInterval is the minimum time between API requests (conservative to avoid 429s).
+	dhanRateLimitInterval = 500 * time.Millisecond
 )
 
 // DhanDataConfig holds configuration for the Dhan data provider.
@@ -289,7 +289,7 @@ func (d *DhanDataProvider) ExportCSV(symbol string, candles []strategy.Candle) e
 	filePath := filepath.Join(d.config.MarketDataDir, symbol+".csv")
 
 	// Merge with existing data if file exists.
-	existing := loadExistingCSV(filePath)
+	existing := LoadExistingCSV(filePath)
 	merged := mergeCandles(existing, candles)
 
 	// Sort by date.
@@ -329,9 +329,9 @@ func (d *DhanDataProvider) ExportCSV(symbol string, candles []strategy.Candle) e
 	return nil
 }
 
-// loadExistingCSV reads candles from an existing CSV file.
+// LoadExistingCSV reads candles from an existing CSV file.
 // Returns empty slice if file doesn't exist or has errors.
-func loadExistingCSV(path string) []strategy.Candle {
+func LoadExistingCSV(path string) []strategy.Candle {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -361,7 +361,8 @@ func loadExistingCSV(path string) []strategy.Candle {
 		high, _ := strconv.ParseFloat(record[2], 64)
 		low, _ := strconv.ParseFloat(record[3], 64)
 		closeP, _ := strconv.ParseFloat(record[4], 64)
-		volume, _ := strconv.ParseInt(record[5], 10, 64)
+		volumeF, _ := strconv.ParseFloat(record[5], 64)
+		volume := int64(volumeF)
 
 		candles = append(candles, strategy.Candle{
 			Date:   date,

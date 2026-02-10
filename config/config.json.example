@@ -22,5 +22,10 @@
     }
   },
   "database_url": "postgres://algo:algo123@localhost:5432/algo_trading?sslmode=disable",
-  "market_calendar_path": "./config/holidays_2026.json"
+  "market_calendar_path": "./config/holidays_2026.json",
+  "webhook": {
+    "enabled": false,
+    "port": 8080,
+    "path": "/webhook/dhan/order"
+  }
 }

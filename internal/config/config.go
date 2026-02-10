@@ -44,6 +44,21 @@ type Config struct {
 
 	// MarketCalendarPath points to the exchange calendar data file.
 	MarketCalendarPath string `json:"market_calendar_path"`
+
+	// Webhook server configuration for receiving broker postback notifications.
+	Webhook WebhookConfig `json:"webhook"`
+}
+
+// WebhookConfig holds settings for the order postback HTTP server.
+type WebhookConfig struct {
+	// Enabled controls whether the webhook server starts.
+	Enabled bool `json:"enabled"`
+
+	// Port is the HTTP port the webhook server listens on.
+	Port int `json:"port"`
+
+	// Path is the URL path for the postback endpoint (default: /webhook/dhan/order).
+	Path string `json:"path"`
 }
 
 // RiskConfig defines hard risk guardrails.
@@ -139,5 +154,41 @@ func (c *Config) Validate() error {
 	if c.DatabaseURL == "" {
 		return fmt.Errorf("database_url is required")
 	}
+
+	// Live mode has stricter requirements to prevent accidental real trading.
+	if c.TradingMode == ModeLive {
+		if err := c.validateLiveMode(); err != nil {
+			return fmt.Errorf("live mode: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// validateLiveMode enforces extra safety checks when running with real money.
+func (c *Config) validateLiveMode() error {
+	// Broker config must exist for the active broker.
+	if c.BrokerConfig == nil {
+		return fmt.Errorf("broker_config is required for live trading")
+	}
+	if _, ok := c.BrokerConfig[c.ActiveBroker]; !ok {
+		return fmt.Errorf("broker_config[%q] is required for live trading", c.ActiveBroker)
+	}
+
+	// Safety cap: max 5 open positions in live mode.
+	if c.Risk.MaxOpenPositions > 5 {
+		return fmt.Errorf("max_open_positions cannot exceed 5 in live mode (got %d)", c.Risk.MaxOpenPositions)
+	}
+
+	// Safety cap: max 2%% risk per trade in live mode.
+	if c.Risk.MaxRiskPerTradePct > 2.0 {
+		return fmt.Errorf("max_risk_per_trade_pct cannot exceed 2%% in live mode (got %.1f%%)", c.Risk.MaxRiskPerTradePct)
+	}
+
+	// Safety cap: max 70%% capital deployment in live mode.
+	if c.Risk.MaxCapitalDeploymentPct > 70.0 {
+		return fmt.Errorf("max_capital_deployment_pct cannot exceed 70%% in live mode (got %.1f%%)", c.Risk.MaxCapitalDeploymentPct)
+	}
+
 	return nil
 }

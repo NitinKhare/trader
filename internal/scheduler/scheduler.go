@@ -118,6 +118,27 @@ func (s *Scheduler) RunMarketHourJobs(ctx context.Context) error {
 	return nil
 }
 
+// ForceRunMarketHourJobs runs market-hour jobs without checking
+// whether the market is currently open. Used in integration tests
+// that need to exercise the full pipeline outside of IST 9:15–15:30.
+func (s *Scheduler) ForceRunMarketHourJobs(ctx context.Context) error {
+	s.logger.Println("[scheduler] force-running market-hour jobs (calendar check skipped)")
+
+	for _, job := range s.jobs {
+		if job.Type != JobTypeMarketHour {
+			continue
+		}
+
+		s.logger.Printf("[scheduler] running market-hour job: %s", job.Name)
+		if err := job.RunFunc(ctx); err != nil {
+			s.logger.Printf("[scheduler] FAILED market-hour job %s: %v", job.Name, err)
+			// Same policy as RunMarketHourJobs: log and continue.
+		}
+	}
+
+	return nil
+}
+
 // RunWeeklyJobs executes weekly maintenance jobs.
 // These typically run on weekends.
 func (s *Scheduler) RunWeeklyJobs(ctx context.Context) error {
