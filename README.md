@@ -175,27 +175,48 @@ Shows: market open/closed, trading day, next session time, available funds, acti
 ## Running Tests
 
 ```bash
-# All Go tests
-go test ./internal/...
+# All Go tests (engine + internal packages)
+go test ./...
 
-# Verbose output
-go test -v ./internal/...
+# E2E paper mode tests (full pipeline: scores → strategy → risk → orders)
+go test -v ./cmd/engine/ -run TestPaperMode
+
+# Config validation tests (includes live mode safety checks)
+go test -v ./internal/config/
+
+# Broker tests (paper + Dhan mocked)
+go test -v ./internal/broker/
+
+# Strategy tests
+go test -v ./internal/strategy/
+
+# Verbose all
+go test -v ./...
 ```
 
-Covers: strategies, risk rules, broker (paper), config validation, market calendar, Dhan data provider (mocked).
+### E2E Test Coverage
+
+| Test | What it verifies |
+|------|-----------------|
+| `TestPaperMode_EndToEnd` | Full buy pipeline: BULL regime + high-score stocks bought, low-score stocks skipped |
+| `TestPaperMode_ExitMonitoring` | Positions exited when regime flips to BEAR |
+| `TestPaperMode_RiskRejection` | Risk manager blocks buys beyond max position limit (5/5 filled, 6th and 7th rejected) |
+
+Tests use `ForceRunMarketHourJobs()` to bypass the IST market-hours check, so they pass at any time of day.
 
 ## Project Structure
 
 ```
-/cmd/engine/              Main engine entry point
+/cmd/engine/              Main engine entry point + E2E tests
 /internal/
-  /broker/                Broker interface + Paper broker + Dhan stub
-  /strategy/              Strategy interface + Trend Following strategy
+  /broker/                Broker interface + Dhan API v2 + Paper broker
+  /strategy/              Strategy interface + Trend Following swing strategy
   /risk/                  Hard risk guardrails (cannot be overridden)
   /market/                Market calendar + data management + Dhan data provider
   /scheduler/             Nightly/market-hour/weekly job scheduler
-  /storage/               Database interface + Postgres implementation
-  /config/                Configuration loading and validation
+  /storage/               Database interface + Postgres/TimescaleDB implementation
+  /config/                Configuration loading, validation, live mode checks
+  /webhook/               HTTP server for Dhan order postback notifications
 /python_ai/
   /features/              Technical indicator calculations
   /scoring/               Stock scoring + market regime detection
@@ -237,6 +258,167 @@ Next morning (during market hours, 9:15 AM - 3:30 PM IST):
 Check anytime:
   4. Run: go run ./cmd/engine --config config/config.json --mode status
 ```
+
+## Engine Capabilities
+
+### Dhan Broker Integration (Task 1)
+
+Full implementation of the Dhan v2 API (`internal/broker/dhan.go`):
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `PlaceOrder` | `POST /v2/orders` | Place BUY/SELL orders (LIMIT, MARKET, SL, SL-M) |
+| `CancelOrder` | `DELETE /v2/orders/{id}` | Cancel a pending order by ID |
+| `GetOrderStatus` | `GET /v2/orders/{id}` | Check order fill status |
+| `GetFunds` | `GET /v2/fundlimit` | Query available cash, margin, balance |
+| `GetHoldings` | `GET /v2/holdings` | List current delivery holdings |
+| `GetPositions` | `GET /v2/positions` | List intraday/overnight positions |
+
+- **Paper broker** (`internal/broker/paper.go`): Simulates instant fills at order price with full fund/holding tracking. Used for testing without real money.
+- **Broker registry**: `broker.New("dhan", configJSON)` auto-selects the right implementation.
+- Instrument file for NSE ticker-to-securityId mapping.
+
+### Market-Hour Trade Execution Engine (Task 2)
+
+Two market-hour jobs run during NSE hours (9:15 AM - 3:30 PM IST):
+
+**`execute_trades` job** — Entry pipeline:
+1. Reads today's `market_regime.json` (BULL/SIDEWAYS/BEAR)
+2. Reads today's `stock_scores.json` (ranked by AI composite score)
+3. Sorts stocks by rank, loads candle history for each
+4. Runs the trend-following strategy on each stock
+5. Validates BUY intents through risk manager
+6. Places approved LIMIT orders via the broker
+7. Tracks and decrements available capital across multiple buys
+
+**`monitor_exits` job** — Exit pipeline:
+1. Gets current holdings from broker
+2. Loads today's regime + scores for each held stock
+3. Evaluates exit conditions (BEAR regime, trend collapse below 0.3)
+4. Places SELL orders for positions that should exit
+
+**Strategy: Trend-Following Swing** (`trend_follow_v1`):
+- Entry: BULL regime, trend >= 0.6, breakout >= 0.5, liquidity >= 0.4, risk <= 0.5
+- Exit: BEAR regime or trend drops below 0.3
+- Sizing: ATR-based stop-loss (2x ATR), 2:1 risk-reward ratio
+
+### Order Postback Webhook (Task 3)
+
+HTTP server (`internal/webhook/`) receives real-time order status updates from Dhan:
+
+- Listens on configurable port/path (default: `:8080/webhook/dhan/order`)
+- Parses Dhan postback JSON (TRANSIT, PENDING, TRADED, REJECTED, CANCELLED, EXPIRED)
+- Maps to broker-agnostic `OrderUpdate` type
+- Multiple callback handlers via `OnOrderUpdate()`
+- Graceful shutdown
+
+Enable in config:
+```json
+"webhook": {
+  "enabled": true,
+  "port": 8080,
+  "path": "/webhook/dhan/order"
+}
+```
+
+### Trade Logging to PostgreSQL (Task 4)
+
+All trade actions persisted to Postgres (`internal/storage/postgres.go`):
+
+| Table | Contents |
+|-------|----------|
+| `trade_records` | Open/closed trades: entry/exit price, P&L, strategy ID, status |
+| `trade_logs` | Every engine decision: `BUY_PLACED`, `BUY_REJECTED`, `EXIT_PLACED`, etc. |
+| `signal_records` | Strategy signals with approval/rejection details |
+| `ai_scores` | AI stock scores per date (for backtesting) |
+| `candles` | OHLCV market data (TimescaleDB hypertable for time-series queries) |
+
+- Engine works without DB (logs a warning, continues without persistence)
+- Connection pooling: pgx driver, 10 max / 5 idle connections
+- DB errors are logged but never crash the engine
+
+### Live Mode Switch with Safety (Task 6)
+
+Multiple safety layers prevent accidental live trading:
+
+**Double confirmation at startup** — both required or engine exits:
+```bash
+ALGO_LIVE_CONFIRMED=true go run ./cmd/engine --mode market --confirm-live
+```
+
+**Live mode config validation** (`internal/config/config.go`):
+
+| Rule | Live Mode Limit | Paper Mode |
+|------|-----------------|------------|
+| `broker_config[active_broker]` | Required | Not required |
+| `max_open_positions` | <= 5 | No limit |
+| `max_risk_per_trade_pct` | <= 2% | No limit |
+| `max_capital_deployment_pct` | <= 70% | No limit |
+| `database_url` | Required (trades must be logged) | Required |
+
+Missing either `--confirm-live` flag or `ALGO_LIVE_CONFIRMED=true` env var prints a safety banner:
+```
+  ╔═══════════════════════════════════════════════════════════╗
+  ║                    ⚠  LIVE MODE BLOCKED  ⚠                ║
+  ╠═══════════════════════════════════════════════════════════╣
+  ║  Live trading requires TWO explicit confirmations:       ║
+  ║  1. CLI flag:   --confirm-live                            ║
+  ║  2. Env var:    ALGO_LIVE_CONFIRMED=true                  ║
+  ╚═══════════════════════════════════════════════════════════╝
+```
+
+### Risk Management
+
+All trade intents pass through the risk manager (`internal/risk/risk.go`) before execution:
+
+| Rule | Description |
+|------|-------------|
+| Mandatory stop loss | Every BUY must have a stop loss price |
+| Max risk per trade | Single trade cannot risk more than N% of capital |
+| Max open positions | Hard limit on concurrent positions |
+| Max daily loss | Trading halts if daily loss exceeds threshold |
+| Max capital deployment | Limits total capital deployed at once |
+| Sufficient capital | Order value cannot exceed available cash |
+
+EXIT intents always pass. SKIP/HOLD intents bypass validation.
+
+## CLI Reference
+
+### Commands
+
+```bash
+# Check system status (market hours, funds, mode)
+go run ./cmd/engine --mode status
+
+# Run nightly jobs (data sync, AI scoring, watchlist)
+go run ./cmd/engine --mode nightly
+
+# Run market-hour jobs in paper mode (default)
+go run ./cmd/engine --mode market
+
+# Run in live mode (double confirmation required)
+ALGO_LIVE_CONFIRMED=true go run ./cmd/engine --mode market --confirm-live
+
+# Custom config path
+go run ./cmd/engine --config /path/to/config.json --mode market
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | `config/config.json` | Path to configuration file |
+| `--mode` | `status` | Run mode: `nightly`, `market`, or `status` |
+| `--confirm-live` | `false` | Required safety flag to enable live trading |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `ALGO_TRADING_MODE` | Override config `trading_mode` (`paper` or `live`) |
+| `ALGO_DATABASE_URL` | Override config `database_url` |
+| `ALGO_ACTIVE_BROKER` | Override config `active_broker` |
+| `ALGO_LIVE_CONFIRMED` | Must be `true` (with `--confirm-live`) to start live mode |
 
 ## Architecture
 
