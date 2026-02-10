@@ -319,31 +319,44 @@ func TestDhanBroker_GetFunds(t *testing.T) {
 
 func TestDhanBroker_GetHoldings(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v2/holdings" {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/holdings":
+			json.NewEncoder(w).Encode([]dhanHoldingResp{
+				{
+					Exchange:      "NSE",
+					TradingSymbol: "RELIANCE",
+					SecurityID:    "2885",
+					ISIN:          "INE002A01018",
+					TotalQty:      20,
+					AvailableQty:  20,
+					AvgCostPrice:  2450.50,
+				},
+				{
+					Exchange:      "NSE",
+					TradingSymbol: "TCS",
+					SecurityID:    "11536",
+					TotalQty:      10,
+					AvailableQty:  10,
+					AvgCostPrice:  4100.00,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/marketfeed/ltp":
+			// Return mock LTP data for the two securities.
+			json.NewEncoder(w).Encode(dhanLTPResp{
+				Status: "success",
+				Data: map[string]map[string]dhanLTPEntry{
+					"NSE_EQ": {
+						"2885":  {LastPrice: 2655.00},
+						"11536": {LastPrice: 4250.75},
+					},
+				},
+			})
+		default:
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]dhanHoldingResp{
-			{
-				Exchange:      "NSE",
-				TradingSymbol: "RELIANCE",
-				SecurityID:    "2885",
-				ISIN:          "INE002A01018",
-				TotalQty:      20,
-				AvailableQty:  20,
-				AvgCostPrice:  2450.50,
-			},
-			{
-				Exchange:      "NSE",
-				TradingSymbol: "TCS",
-				SecurityID:    "11536",
-				TotalQty:      10,
-				AvailableQty:  10,
-				AvgCostPrice:  4100.00,
-			},
-		})
 	}))
 	defer server.Close()
 
@@ -356,6 +369,8 @@ func TestDhanBroker_GetHoldings(t *testing.T) {
 	if len(holdings) != 2 {
 		t.Fatalf("expected 2 holdings, got %d", len(holdings))
 	}
+
+	// Verify RELIANCE holding with LTP-enriched fields.
 	if holdings[0].Symbol != "RELIANCE" {
 		t.Errorf("expected RELIANCE, got %s", holdings[0].Symbol)
 	}
@@ -365,8 +380,77 @@ func TestDhanBroker_GetHoldings(t *testing.T) {
 	if holdings[0].AveragePrice != 2450.50 {
 		t.Errorf("expected avg price 2450.50, got %f", holdings[0].AveragePrice)
 	}
+	if holdings[0].LastPrice != 2655.00 {
+		t.Errorf("expected last price 2655.00, got %f", holdings[0].LastPrice)
+	}
+	// PnL = 20 * (2655.00 - 2450.50) = 20 * 204.50 = 4090.00
+	expectedPnL := 20.0 * (2655.00 - 2450.50)
+	if holdings[0].PnL != expectedPnL {
+		t.Errorf("expected PnL %.2f, got %.2f", expectedPnL, holdings[0].PnL)
+	}
+
+	// Verify TCS holding.
 	if holdings[1].Symbol != "TCS" {
 		t.Errorf("expected TCS, got %s", holdings[1].Symbol)
+	}
+	if holdings[1].LastPrice != 4250.75 {
+		t.Errorf("expected last price 4250.75, got %f", holdings[1].LastPrice)
+	}
+	// PnL = 10 * (4250.75 - 4100.00) = 10 * 150.75 = 1507.50
+	expectedPnL2 := 10.0 * (4250.75 - 4100.00)
+	if holdings[1].PnL != expectedPnL2 {
+		t.Errorf("expected PnL %.2f, got %.2f", expectedPnL2, holdings[1].PnL)
+	}
+}
+
+// TestDhanBroker_GetHoldings_LTPFailure verifies graceful degradation
+// when the LTP API fails — holdings should still be returned with zero LTP/PnL.
+func TestDhanBroker_GetHoldings_LTPFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/holdings":
+			json.NewEncoder(w).Encode([]dhanHoldingResp{
+				{
+					Exchange:      "NSE",
+					TradingSymbol: "RELIANCE",
+					SecurityID:    "2885",
+					TotalQty:      20,
+					AvgCostPrice:  2450.50,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/marketfeed/ltp":
+			// Simulate LTP API failure.
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"errorType":"ServerError","errorCode":"DH-500","errorMessage":"Internal server error"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	b := makeTestDhanBroker(t, server.URL)
+
+	holdings, err := b.GetHoldings(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(holdings) != 1 {
+		t.Fatalf("expected 1 holding, got %d", len(holdings))
+	}
+	if holdings[0].Symbol != "RELIANCE" {
+		t.Errorf("expected RELIANCE, got %s", holdings[0].Symbol)
+	}
+	// LTP should be zero (graceful degradation).
+	if holdings[0].LastPrice != 0 {
+		t.Errorf("expected last price 0 on LTP failure, got %f", holdings[0].LastPrice)
+	}
+	// PnL = 20 * (0 - 2450.50) = negative, but that's expected with zero LTP.
+	expectedPnL := 20.0 * (0 - 2450.50)
+	if holdings[0].PnL != expectedPnL {
+		t.Errorf("expected PnL %.2f on LTP failure, got %.2f", expectedPnL, holdings[0].PnL)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -228,6 +229,17 @@ type dhanPositionResp struct {
 	UnrealizedProfit float64 `json:"unrealizedProfit"`
 }
 
+// dhanLTPResp is the response from POST /v2/marketfeed/ltp.
+// Structure: { "data": { "NSE_EQ": { "1330": { "last_price": 2655.0 } } }, "status": "success" }
+type dhanLTPResp struct {
+	Data   map[string]map[string]dhanLTPEntry `json:"data"`
+	Status string                             `json:"status"`
+}
+
+type dhanLTPEntry struct {
+	LastPrice float64 `json:"last_price"`
+}
+
 // dhanErrorResp is the standard Dhan error response.
 type dhanErrorResp struct {
 	ErrorType    string `json:"errorType"`
@@ -393,7 +405,8 @@ func (d *DhanBroker) GetFunds(ctx context.Context) (*Fund, error) {
 	}, nil
 }
 
-// GetHoldings retrieves delivery holdings via GET /v2/holdings.
+// GetHoldings retrieves delivery holdings via GET /v2/holdings, then
+// enriches each holding with the last traded price from the LTP API.
 func (d *DhanBroker) GetHoldings(ctx context.Context) ([]Holding, error) {
 	respBody, err := d.doRequest(ctx, http.MethodGet, "/v2/holdings", nil)
 	if err != nil {
@@ -405,17 +418,80 @@ func (d *DhanBroker) GetHoldings(ctx context.Context) ([]Holding, error) {
 		return nil, fmt.Errorf("dhan broker GetHoldings: parse response: %w", err)
 	}
 
+	if len(dhanHoldings) == 0 {
+		return nil, nil
+	}
+
+	// Fetch LTP for all held securities in a single batch call.
+	ltpMap := d.fetchLTP(ctx, dhanHoldings)
+
 	holdings := make([]Holding, 0, len(dhanHoldings))
 	for _, h := range dhanHoldings {
+		lastPrice := ltpMap[h.SecurityID]
+		pnl := float64(h.TotalQty) * (lastPrice - h.AvgCostPrice)
+
 		holdings = append(holdings, Holding{
 			Symbol:       h.TradingSymbol,
 			Exchange:     h.Exchange,
 			Quantity:     h.TotalQty,
 			AveragePrice: h.AvgCostPrice,
+			LastPrice:    lastPrice,
+			PnL:          pnl,
 		})
 	}
 
 	return holdings, nil
+}
+
+// fetchLTP calls POST /v2/marketfeed/ltp to get last traded prices for
+// the given holdings. Returns a map of securityId → lastPrice.
+// Errors are swallowed — holdings are still returned with zero LTP if
+// the market feed API fails (market may be closed, quota exceeded, etc.).
+func (d *DhanBroker) fetchLTP(ctx context.Context, holdings []dhanHoldingResp) map[string]float64 {
+	result := make(map[string]float64)
+
+	// Build request body: { "NSE_EQ": [secId1, secId2, ...] }
+	// Dhan exchange field in holdings is "NSE" but LTP API uses "NSE_EQ".
+	segmentMap := map[string]string{
+		"NSE": "NSE_EQ",
+		"BSE": "BSE_EQ",
+	}
+
+	reqBody := make(map[string][]int)
+	for _, h := range holdings {
+		segment, ok := segmentMap[h.Exchange]
+		if !ok {
+			segment = h.Exchange + "_EQ" // fallback
+		}
+		secID, err := strconv.Atoi(h.SecurityID)
+		if err != nil {
+			continue // skip if securityId is not numeric
+		}
+		reqBody[segment] = append(reqBody[segment], secID)
+	}
+
+	if len(reqBody) == 0 {
+		return result
+	}
+
+	respBody, err := d.doRequest(ctx, http.MethodPost, "/v2/marketfeed/ltp", reqBody)
+	if err != nil {
+		return result // graceful degradation — LTP unavailable
+	}
+
+	var ltpResp dhanLTPResp
+	if err := json.Unmarshal(respBody, &ltpResp); err != nil {
+		return result
+	}
+
+	// Flatten the nested response into securityId → lastPrice.
+	for _, securities := range ltpResp.Data {
+		for secID, entry := range securities {
+			result[secID] = entry.LastPrice
+		}
+	}
+
+	return result
 }
 
 // GetPositions retrieves open positions via GET /v2/positions.
