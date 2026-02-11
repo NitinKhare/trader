@@ -98,7 +98,7 @@ func runJobsDirectly(t *testing.T, cfg *config.Config,
 	t.Helper()
 	cal := market.NewCalendarFromHolidays(map[string]string{})
 	sched := scheduler.New(cal, logger)
-	registerMarketJobs(sched, cfg, b, strats, riskMgr, nil, nil, nil, logger)
+	registerMarketJobs(sched, cfg, b, strats, riskMgr, nil, nil, nil, nil, nil, logger)
 	ctx := context.Background()
 	if err := sched.ForceRunMarketHourJobs(ctx); err != nil {
 		t.Fatalf("ForceRunMarketHourJobs failed: %v", err)

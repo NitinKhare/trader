@@ -87,6 +87,44 @@ type RiskConfig struct {
 	// MaxHoldDays is the maximum calendar days a position may be held.
 	// Positions held longer are force-exited. 0 means disabled.
 	MaxHoldDays int `json:"max_hold_days"`
+
+	// TrailingStop configures trailing stop-loss behavior.
+	TrailingStop TrailingStopConfig `json:"trailing_stop"`
+
+	// CircuitBreaker configures automatic trading halt on repeated failures.
+	CircuitBreaker CircuitBreakerConfig `json:"circuit_breaker"`
+}
+
+// TrailingStopConfig controls trailing stop-loss behavior.
+// When enabled, stop-loss orders are adjusted upward as price moves in favor.
+type TrailingStopConfig struct {
+	// Enabled toggles trailing stop-loss. false = disabled.
+	Enabled bool `json:"enabled"`
+
+	// TrailPct is the percentage below the highest price since entry
+	// at which the trailing stop is set. E.g. 1.5 means trail 1.5% below high.
+	TrailPct float64 `json:"trail_pct"`
+
+	// ActivationPct is the minimum profit percentage before trailing begins.
+	// E.g. 2.0 means trailing only starts after 2% unrealized profit.
+	// 0 = start trailing immediately.
+	ActivationPct float64 `json:"activation_pct"`
+}
+
+// CircuitBreakerConfig configures the automatic trading halt thresholds.
+// Zero values for thresholds mean that specific check is disabled.
+type CircuitBreakerConfig struct {
+	// MaxConsecutiveFailures trips the breaker after N consecutive failures.
+	// 0 = disabled.
+	MaxConsecutiveFailures int `json:"max_consecutive_failures"`
+
+	// MaxFailuresPerHour trips the breaker after N failures in a rolling hour.
+	// 0 = disabled.
+	MaxFailuresPerHour int `json:"max_failures_per_hour"`
+
+	// CooldownMinutes is the auto-reset period after tripping.
+	// 0 = no auto-reset (requires manual reset or engine restart).
+	CooldownMinutes int `json:"cooldown_minutes"`
 }
 
 // PathsConfig defines filesystem paths for inter-layer communication.

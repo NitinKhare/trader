@@ -226,6 +226,17 @@ func (ps *PostgresStore) UpdateTradeSLOrderID(ctx context.Context, tradeID int64
 	return nil
 }
 
+func (ps *PostgresStore) UpdateTradeStopLoss(ctx context.Context, tradeID int64, newStopLoss float64, newSLOrderID string) error {
+	_, err := ps.db.ExecContext(ctx,
+		`UPDATE trades SET stop_loss = $1, sl_order_id = $2 WHERE id = $3`,
+		newStopLoss, newSLOrderID, tradeID,
+	)
+	if err != nil {
+		return fmt.Errorf("update trade stop_loss: %w", err)
+	}
+	return nil
+}
+
 func (ps *PostgresStore) CloseTrade(ctx context.Context, tradeID int64, exitPrice float64, exitReason string) error {
 	now := time.Now()
 	_, err := ps.db.ExecContext(ctx,

@@ -97,6 +97,8 @@ type Store interface {
 	CloseTrade(ctx context.Context, tradeID int64, exitPrice float64, exitReason string) error
 	// UpdateTradeSLOrderID sets the stop-loss order ID for an open trade.
 	UpdateTradeSLOrderID(ctx context.Context, tradeID int64, slOrderID string) error
+	// UpdateTradeStopLoss updates the stop-loss price and SL order ID for trailing stops.
+	UpdateTradeStopLoss(ctx context.Context, tradeID int64, newStopLoss float64, newSLOrderID string) error
 
 	// Signal operations.
 	SaveSignal(ctx context.Context, signal *SignalRecord) error

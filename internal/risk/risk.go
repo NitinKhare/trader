@@ -65,6 +65,12 @@ func (m *Manager) UpdateCapital(newCapital float64) {
 	}
 }
 
+// UpdateRiskConfig replaces the risk configuration atomically.
+// Used by config hot-reload to update risk params without restarting.
+func (m *Manager) UpdateRiskConfig(newCfg config.RiskConfig) {
+	m.config = newCfg
+}
+
 // Validate checks a TradeIntent against all risk rules.
 // It takes the current state of open positions, daily P&L, and an optional sector map.
 // sectorMap maps symbol → sector name. Pass nil to skip sector checks.

@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -127,6 +128,9 @@ func main() {
 	// Initialize risk manager.
 	riskMgr := risk.NewManager(cfg.Risk, cfg.Capital)
 
+	// Initialize circuit breaker for automatic trading halt on repeated failures.
+	cb := risk.NewCircuitBreaker(cfg.Risk.CircuitBreaker, logger)
+
 	// Initialize strategies.
 	strategies := []strategy.Strategy{
 		strategy.NewTrendFollowStrategy(cfg.Risk),
@@ -160,39 +164,46 @@ func main() {
 		}
 
 	case "market":
+		// WaitGroup for tracking in-flight jobs during graceful shutdown.
+		var wg sync.WaitGroup
+
 		// Start webhook server if enabled (receives order postback notifications).
+		var whServer *webhook.Server
 		if cfg.Webhook.Enabled {
 			whCfg := webhook.Config{
 				Port:    cfg.Webhook.Port,
 				Path:    cfg.Webhook.Path,
 				Enabled: cfg.Webhook.Enabled,
 			}
-			whServer := webhook.NewServer(whCfg, logger)
+			whServer = webhook.NewServer(whCfg, logger)
 
-			// Register a default handler that logs order updates.
-			whServer.OnOrderUpdate(func(u webhook.OrderUpdate) {
-				logger.Printf("[postback] order=%s symbol=%s status=%s filled=%d/%d avg=%.2f tag=%s",
-					u.OrderID, u.Symbol, u.Status, u.FilledQty, u.Quantity, u.AveragePrice, u.CorrelationID)
-				if u.ErrorCode != "" {
-					logger.Printf("[postback] error: %s — %s", u.ErrorCode, u.ErrorMessage)
-				}
-			})
+			// Register postback-driven position update handler.
+			registerPostbackHandler(whServer, activeBroker, store, tc, cb, cfg, logger)
 
 			if err := whServer.Start(); err != nil {
 				logger.Fatalf("failed to start webhook server: %v", err)
 			}
-			defer func() {
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = whServer.Shutdown(shutdownCtx)
-			}()
 		}
 
-		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, tc, sectorMap, logger)
+		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, tc, sectorMap, cb, &wg, logger)
 
 		// Set up context with signal handling for graceful shutdown.
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer cancel()
+
+		// Config hot-reload: watch config file for risk param changes.
+		watcher := config.NewConfigWatcher(*configPath, cfg, logger)
+		watcher.OnChange(func(old, new *config.Config) {
+			riskMgr.UpdateRiskConfig(new.Risk)
+			cb.UpdateConfig(new.Risk.CircuitBreaker)
+			// Update cfg pointer so jobs see new trailing stop config etc.
+			*cfg = *new
+			logger.Printf("[hot-reload] risk config updated")
+		})
+		if watchErr := watcher.Start(); watchErr != nil {
+			logger.Printf("WARNING: config watcher failed to start: %v", watchErr)
+		}
+		defer watcher.Stop()
 
 		pollingInterval := time.Duration(cfg.PollingIntervalMinutes) * time.Minute
 		if pollingInterval <= 0 {
@@ -205,6 +216,9 @@ func main() {
 			logger.Printf("[market] continuous polling: interval=%v", pollingInterval)
 			runContinuousMarketLoop(ctx, sched, cal, pollingInterval, logger)
 		}
+
+		// Graceful shutdown: wait for in-flight jobs to complete.
+		gracefulShutdown(&wg, whServer, logger)
 
 	case "analytics":
 		runAnalytics(store, cfg, logger)
@@ -384,6 +398,8 @@ func registerMarketJobs(
 	store *storage.PostgresStore,
 	tc *tradeContext,
 	sectorMap map[string]string,
+	cb *risk.CircuitBreaker,
+	wg *sync.WaitGroup,
 	logger *log.Logger,
 ) {
 	// Job: Execute pre-planned trades from watchlist.
@@ -391,7 +407,17 @@ func registerMarketJobs(
 		Name: "execute_trades",
 		Type: scheduler.JobTypeMarketHour,
 		RunFunc: func(ctx context.Context) error {
+			if wg != nil {
+				wg.Add(1)
+				defer wg.Done()
+			}
 			logger.Println("checking for trade execution opportunities...")
+
+			// Circuit breaker check: skip new entries if tripped.
+			if cb != nil && cb.IsTripped() {
+				logger.Printf("[circuit-breaker] trading halted: %s — skipping execute_trades", cb.TripReason())
+				return nil
+			}
 
 			// Read AI scores and regime for today.
 			today := time.Now().In(market.IST).Format("2006-01-02")
@@ -412,7 +438,13 @@ func registerMarketJobs(
 			// Get current account state.
 			funds, err := b.GetFunds(ctx)
 			if err != nil {
+				if cb != nil {
+					cb.RecordFailure(fmt.Sprintf("GetFunds: %v", err))
+				}
 				return fmt.Errorf("get funds: %w", err)
+			}
+			if cb != nil {
+				cb.RecordSuccess()
 			}
 			logger.Printf("available capital: %.2f", funds.AvailableCash)
 
@@ -445,7 +477,13 @@ func registerMarketJobs(
 			// Get current holdings to detect existing positions.
 			holdings, err := b.GetHoldings(ctx)
 			if err != nil {
+				if cb != nil {
+					cb.RecordFailure(fmt.Sprintf("GetHoldings: %v", err))
+				}
 				return fmt.Errorf("get holdings: %w", err)
+			}
+			if cb != nil {
+				cb.RecordSuccess()
 			}
 
 			// Reconcile DB open trades with actual broker holdings.
@@ -538,7 +576,13 @@ func registerMarketJobs(
 						if err != nil {
 							logger.Printf("  %s [%s]: BUY ORDER FAILED — %v",
 								score.Symbol, strat.ID(), err)
+							if cb != nil {
+								cb.RecordFailure(fmt.Sprintf("PlaceOrder BUY %s: %v", score.Symbol, err))
+							}
 							continue
+						}
+						if cb != nil {
+							cb.RecordSuccess()
 						}
 
 						logger.Printf("  %s [%s]: BUY ORDER PLACED — id=%s status=%s qty=%d price=%.2f sl=%.2f tgt=%.2f | %s",
@@ -579,7 +623,7 @@ func registerMarketJobs(
 
 						// Update tradeContext so SL order ID can be tracked.
 						if tc != nil && tradeID > 0 {
-							tc.trades[intent.Symbol] = &storage.TradeRecord{
+							tc.Set(intent.Symbol, &storage.TradeRecord{
 								ID:         tradeID,
 								StrategyID: intent.StrategyID,
 								SignalID:   intent.SignalID,
@@ -592,7 +636,7 @@ func registerMarketJobs(
 								OrderID:    resp.OrderID,
 								EntryTime:  time.Now(),
 								Status:     "open",
-							}
+							})
 						}
 
 						// Place SL-M order at the stop-loss price.
@@ -601,7 +645,7 @@ func registerMarketJobs(
 
 						// Update tradeContext with SL order ID for exit cancellation.
 						if tc != nil && slOrderID != "" {
-							if trade, ok := tc.trades[intent.Symbol]; ok {
+							if trade, ok := tc.Get(intent.Symbol); ok {
 								trade.SLOrderID = slOrderID
 							}
 						}
@@ -631,7 +675,7 @@ func registerMarketJobs(
 
 						// Cancel existing SL order before placing exit (prevents double sell).
 						if tc != nil {
-							if trade, ok := tc.trades[intent.Symbol]; ok && trade.SLOrderID != "" {
+							if trade, ok := tc.Get(intent.Symbol); ok && trade.SLOrderID != "" {
 								cancelStopLossOrder(ctx, b, logger, trade.SLOrderID, intent.Symbol)
 							}
 						}
@@ -678,11 +722,21 @@ func registerMarketJobs(
 		Name: "monitor_exits",
 		Type: scheduler.JobTypeMarketHour,
 		RunFunc: func(ctx context.Context) error {
+			if wg != nil {
+				wg.Add(1)
+				defer wg.Done()
+			}
 			logger.Println("monitoring open positions for exit conditions...")
 
 			holdings, err := b.GetHoldings(ctx)
 			if err != nil {
+				if cb != nil {
+					cb.RecordFailure(fmt.Sprintf("GetHoldings (monitor_exits): %v", err))
+				}
 				return fmt.Errorf("get holdings: %v", err)
+			}
+			if cb != nil {
+				cb.RecordSuccess()
 			}
 
 			if len(holdings) == 0 {
@@ -743,7 +797,7 @@ func registerMarketJobs(
 
 				// Max holding period check: force exit if held too long.
 				if cfg.Risk.MaxHoldDays > 0 && tc != nil {
-					if trade, ok := tc.trades[h.Symbol]; ok {
+					if trade, ok := tc.Get(h.Symbol); ok {
 						holdDays := int(time.Since(trade.EntryTime).Hours() / 24)
 						if holdDays >= cfg.Risk.MaxHoldDays {
 							logger.Printf("  %s: max hold period %d days exceeded (held %d days) — forcing exit",
@@ -781,6 +835,11 @@ func registerMarketJobs(
 							continue // skip strategy eval for this holding
 						}
 					}
+				}
+
+				// Trailing stop-loss adjustment: raise SL as price moves in favor.
+				if cfg.Risk.TrailingStop.Enabled && tc != nil {
+					adjustTrailingStopLoss(ctx, b, store, logger, tc, cb, h, cfg.Risk.TrailingStop)
 				}
 
 				// Find score for this holding.
@@ -822,7 +881,7 @@ func registerMarketJobs(
 
 						// Cancel existing SL order before placing exit (prevents double sell).
 						if tc != nil {
-							if trade, ok := tc.trades[h.Symbol]; ok && trade.SLOrderID != "" {
+							if trade, ok := tc.Get(h.Symbol); ok && trade.SLOrderID != "" {
 								cancelStopLossOrder(ctx, b, logger, trade.SLOrderID, h.Symbol)
 							}
 						}
@@ -928,8 +987,74 @@ func saveTradeRecord(ctx context.Context, store *storage.PostgresStore, logger *
 // tradeContext maps symbol to its open TradeRecord from the DB.
 // This provides the full entry context (stop loss, target, strategy ID, etc.)
 // that is lost when the engine restarts.
+// Thread-safe: accessed from market-hour jobs and webhook postback handler concurrently.
 type tradeContext struct {
+	mu     sync.RWMutex
 	trades map[string]*storage.TradeRecord // symbol -> open trade
+}
+
+// Get returns the trade record for a symbol (thread-safe).
+func (tc *tradeContext) Get(symbol string) (*storage.TradeRecord, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	t, ok := tc.trades[symbol]
+	return t, ok
+}
+
+// Set stores a trade record for a symbol (thread-safe).
+func (tc *tradeContext) Set(symbol string, trade *storage.TradeRecord) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	tc.trades[symbol] = trade
+}
+
+// Delete removes a trade record by symbol (thread-safe).
+func (tc *tradeContext) Delete(symbol string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	delete(tc.trades, symbol)
+}
+
+// GetByOrderID finds a trade by its entry order ID (thread-safe).
+func (tc *tradeContext) GetByOrderID(orderID string) (string, *storage.TradeRecord, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	for sym, t := range tc.trades {
+		if t.OrderID == orderID {
+			return sym, t, true
+		}
+	}
+	return "", nil, false
+}
+
+// GetBySLOrderID finds a trade by its stop-loss order ID (thread-safe).
+func (tc *tradeContext) GetBySLOrderID(slOrderID string) (string, *storage.TradeRecord, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	for sym, t := range tc.trades {
+		if t.SLOrderID == slOrderID {
+			return sym, t, true
+		}
+	}
+	return "", nil, false
+}
+
+// Snapshot returns a copy of all trades for iteration (thread-safe).
+func (tc *tradeContext) Snapshot() map[string]*storage.TradeRecord {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	snap := make(map[string]*storage.TradeRecord, len(tc.trades))
+	for k, v := range tc.trades {
+		snap[k] = v
+	}
+	return snap
+}
+
+// Len returns the number of tracked trades (thread-safe).
+func (tc *tradeContext) Len() int {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	return len(tc.trades)
 }
 
 // loadTradeContext loads open trades from the database and returns a lookup structure.
@@ -950,7 +1075,7 @@ func loadTradeContext(ctx context.Context, store *storage.PostgresStore, logger 
 	}
 	for i := range openTrades {
 		t := &openTrades[i]
-		tc.trades[t.Symbol] = t
+		tc.trades[t.Symbol] = t // direct access OK during init (no concurrent access yet)
 		logger.Printf("[positions] restored: %s strategy=%s entry=%.2f sl=%.2f tgt=%.2f qty=%d",
 			t.Symbol, t.StrategyID, t.EntryPrice, t.StopLoss, t.Target, t.Quantity)
 	}
@@ -974,7 +1099,7 @@ func enrichPosition(h broker.Holding, tc *tradeContext) strategy.PositionInfo {
 		return pos
 	}
 
-	if trade, ok := tc.trades[h.Symbol]; ok {
+	if trade, ok := tc.Get(h.Symbol); ok {
 		pos.StopLoss = trade.StopLoss
 		pos.Target = trade.Target
 		pos.StrategyID = trade.StrategyID
@@ -1011,7 +1136,8 @@ func reconcilePositions(
 	}
 
 	// Check each DB open trade against broker holdings.
-	for symbol, trade := range tc.trades {
+	snapshot := tc.Snapshot()
+	for symbol, trade := range snapshot {
 		h, brokerHasIt := holdingsMap[symbol]
 		if !brokerHasIt {
 			// Position was closed outside the engine (manual sell, broker-side SL, etc.)
@@ -1020,7 +1146,7 @@ func reconcilePositions(
 			if err := store.CloseTrade(ctx, trade.ID, 0, "external_close"); err != nil {
 				logger.Printf("[reconcile] WARNING: failed to close trade %d: %v", trade.ID, err)
 			}
-			delete(tc.trades, symbol)
+			tc.Delete(symbol)
 			continue
 		}
 
@@ -1033,7 +1159,7 @@ func reconcilePositions(
 
 	// Check for positions in broker but not in DB.
 	for symbol := range holdingsMap {
-		if _, inDB := tc.trades[symbol]; !inDB {
+		if _, inDB := tc.Get(symbol); !inDB {
 			logger.Printf("[reconcile] %s: broker has holding but no open trade in DB — position lacks SL/target context",
 				symbol)
 		}
@@ -1084,7 +1210,7 @@ func closeTradeRecord(
 	if store == nil || tc == nil {
 		return
 	}
-	trade, ok := tc.trades[symbol]
+	trade, ok := tc.Get(symbol)
 	if !ok {
 		return
 	}
@@ -1093,7 +1219,7 @@ func closeTradeRecord(
 	} else {
 		logger.Printf("[db] trade %d closed: %s exit=%.2f reason=%s",
 			trade.ID, symbol, exitPrice, exitReason)
-		delete(tc.trades, symbol)
+		tc.Delete(symbol)
 	}
 }
 
@@ -1260,7 +1386,7 @@ func calculateDailyPnL(
 	for _, h := range holdings {
 		entryPrice := h.AveragePrice
 		if tc != nil {
-			if trade, ok := tc.trades[h.Symbol]; ok {
+			if trade, ok := tc.Get(h.Symbol); ok {
 				entryPrice = trade.EntryPrice
 			}
 		}
@@ -1381,6 +1507,218 @@ func runAnalytics(store *storage.PostgresStore, cfg *config.Config, logger *log.
 
 	report := analytics.Analyze(trades, cfg.Capital)
 	fmt.Println(analytics.FormatReport(report))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Graceful shutdown
+// ────────────────────────────────────────────────────────────────────
+
+// gracefulShutdown waits for in-flight jobs to complete and shuts down
+// the webhook server. Called after the market loop exits.
+func gracefulShutdown(wg *sync.WaitGroup, whServer *webhook.Server, logger *log.Logger) {
+	logger.Println("[shutdown] waiting for in-flight jobs to complete...")
+
+	done := make(chan struct{})
+	go func() {
+		if wg != nil {
+			wg.Wait()
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Println("[shutdown] all jobs completed")
+	case <-time.After(30 * time.Second):
+		logger.Println("[shutdown] timeout waiting for jobs — forcing shutdown")
+	}
+
+	// Shut down webhook server.
+	if whServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := whServer.Shutdown(shutdownCtx); err != nil {
+			logger.Printf("[shutdown] webhook server error: %v", err)
+		} else {
+			logger.Println("[shutdown] webhook server stopped")
+		}
+	}
+
+	logger.Println("[shutdown] complete")
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Trailing stop-loss adjustment
+// ────────────────────────────────────────────────────────────────────
+
+// adjustTrailingStopLoss checks if the current price warrants raising the
+// stop-loss for a position. If so, cancels the old SL order and places a new
+// one at the higher level. Updates both tradeContext and database.
+func adjustTrailingStopLoss(
+	ctx context.Context,
+	b broker.Broker,
+	store *storage.PostgresStore,
+	logger *log.Logger,
+	tc *tradeContext,
+	cb *risk.CircuitBreaker,
+	h broker.Holding,
+	tsCfg config.TrailingStopConfig,
+) {
+	if tc == nil || !tsCfg.Enabled || tsCfg.TrailPct <= 0 {
+		return
+	}
+
+	trade, ok := tc.Get(h.Symbol)
+	if !ok || trade.StopLoss <= 0 {
+		return
+	}
+
+	lastPrice := h.LastPrice
+	if lastPrice <= 0 {
+		return
+	}
+
+	// Check activation: trailing only starts after ActivationPct profit.
+	profitPct := (lastPrice - trade.EntryPrice) / trade.EntryPrice * 100
+	if profitPct < tsCfg.ActivationPct {
+		return // not enough profit yet to start trailing
+	}
+
+	// Calculate new trailing stop.
+	newSL := lastPrice * (1 - tsCfg.TrailPct/100)
+
+	// Only raise the stop-loss, never lower it.
+	if newSL <= trade.StopLoss {
+		return
+	}
+
+	logger.Printf("[trailing-sl] %s: raising SL from %.2f to %.2f (price=%.2f profit=%.1f%%)",
+		h.Symbol, trade.StopLoss, newSL, lastPrice, profitPct)
+
+	// Cancel the existing SL order.
+	if trade.SLOrderID != "" {
+		cancelStopLossOrder(ctx, b, logger, trade.SLOrderID, h.Symbol)
+	}
+
+	// Place new SL-M order at the higher level.
+	newSLOrderID := placeStopLossOrder(ctx, b, store, logger,
+		trade.ID, h.Symbol, "NSE", h.Quantity, newSL, trade.SignalID)
+
+	if newSLOrderID == "" {
+		logger.Printf("[trailing-sl] WARNING: failed to place new SL for %s — position unprotected", h.Symbol)
+		if cb != nil {
+			cb.RecordFailure(fmt.Sprintf("trailing SL placement failed for %s", h.Symbol))
+		}
+		return
+	}
+
+	// Update tradeContext.
+	trade.StopLoss = newSL
+	trade.SLOrderID = newSLOrderID
+
+	// Update database.
+	if store != nil {
+		if err := store.UpdateTradeStopLoss(ctx, trade.ID, newSL, newSLOrderID); err != nil {
+			logger.Printf("[trailing-sl] WARNING: DB update failed for %s: %v", h.Symbol, err)
+		}
+	}
+
+	if cb != nil {
+		cb.RecordSuccess()
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Postback-driven position updates
+// ────────────────────────────────────────────────────────────────────
+
+// registerPostbackHandler wires the webhook server to update trade records
+// in real-time when Dhan sends order postback notifications.
+func registerPostbackHandler(
+	whServer *webhook.Server,
+	b broker.Broker,
+	store *storage.PostgresStore,
+	tc *tradeContext,
+	cb *risk.CircuitBreaker,
+	cfg *config.Config,
+	logger *log.Logger,
+) {
+	if whServer == nil {
+		return
+	}
+
+	whServer.OnOrderUpdate(func(u webhook.OrderUpdate) {
+		logger.Printf("[postback] order=%s symbol=%s side=%s status=%s filled=%d/%d avg=%.2f tag=%s",
+			u.OrderID, u.Symbol, u.Side, u.Status, u.FilledQty, u.Quantity, u.AveragePrice, u.CorrelationID)
+
+		if u.ErrorCode != "" {
+			logger.Printf("[postback] error: %s — %s", u.ErrorCode, u.ErrorMessage)
+		}
+
+		if tc == nil {
+			return
+		}
+
+		ctx := context.Background()
+
+		switch u.Status {
+		case "TRADED", "COMPLETED":
+			// Check if this is an entry order fill.
+			if u.Side == "BUY" {
+				sym, trade, found := tc.GetByOrderID(u.OrderID)
+				if found && trade.SLOrderID == "" {
+					logger.Printf("[postback] entry filled for %s — placing SL order", sym)
+					slOrderID := placeStopLossOrder(ctx, b, store, logger,
+						trade.ID, sym, "NSE", trade.Quantity, trade.StopLoss, trade.SignalID)
+					if slOrderID != "" {
+						trade.SLOrderID = slOrderID
+						logger.Printf("[postback] SL placed for %s: order_id=%s", sym, slOrderID)
+					}
+					if cb != nil {
+						cb.RecordSuccess()
+					}
+				}
+			}
+
+			// Check if this is a SL order fill (stop-loss triggered).
+			if u.Side == "SELL" {
+				sym, trade, found := tc.GetBySLOrderID(u.OrderID)
+				if found {
+					logger.Printf("[postback] SL triggered for %s at avg=%.2f", sym, u.AveragePrice)
+					exitPrice := u.AveragePrice
+					if exitPrice == 0 {
+						exitPrice = trade.StopLoss
+					}
+					if store != nil {
+						if err := store.CloseTrade(ctx, trade.ID, exitPrice, "stop_loss"); err != nil {
+							logger.Printf("[postback] WARNING: failed to close trade %d: %v", trade.ID, err)
+						} else {
+							logger.Printf("[postback] trade %d closed: %s exit=%.2f reason=stop_loss",
+								trade.ID, sym, exitPrice)
+						}
+					}
+					tc.Delete(sym)
+				}
+			}
+
+		case "REJECTED":
+			logger.Printf("[postback] ORDER REJECTED: %s %s — %s", u.OrderID, u.Symbol, u.ErrorMessage)
+			if cb != nil {
+				cb.RecordFailure(fmt.Sprintf("order rejected: %s %s: %s", u.OrderID, u.Symbol, u.ErrorMessage))
+			}
+
+			// Critical: if SL order was rejected, position is unprotected.
+			if u.Side == "SELL" {
+				if sym, _, found := tc.GetBySLOrderID(u.OrderID); found {
+					logger.Printf("[postback] CRITICAL: SL order rejected for %s — position UNPROTECTED", sym)
+				}
+			}
+
+		case "CANCELLED":
+			logger.Printf("[postback] order cancelled: %s %s (normal for SL cancels before exits)",
+				u.OrderID, u.Symbol)
+		}
+	})
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1615,6 +1953,18 @@ func runBacktest(
 			// Check SL/target hits on existing positions using today's candle data.
 			if pos, exists := positions[score.Symbol]; exists {
 				lastCandle := candlesUpToDate[len(candlesUpToDate)-1]
+
+				// Trailing stop-loss adjustment in backtest.
+				if cfg.Risk.TrailingStop.Enabled && cfg.Risk.TrailingStop.TrailPct > 0 {
+					highPrice := lastCandle.High
+					profitPct := (highPrice - pos.entryPrice) / pos.entryPrice * 100
+					if profitPct >= cfg.Risk.TrailingStop.ActivationPct {
+						newSL := highPrice * (1 - cfg.Risk.TrailingStop.TrailPct/100)
+						if newSL > pos.stopLoss {
+							pos.stopLoss = newSL
+						}
+					}
+				}
 
 				var exitPrice float64
 				var exitReason string
