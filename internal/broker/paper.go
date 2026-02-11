@@ -87,6 +87,29 @@ func (pb *PaperBroker) PlaceOrder(_ context.Context, order Order) (*OrderRespons
 	pb.nextID++
 	orderID := fmt.Sprintf("PAPER-%d", pb.nextID)
 
+	// Stop-loss orders are stored as PENDING (trigger not simulated in paper mode).
+	// This prevents paper broker from immediately selling when an SL order is placed.
+	if order.Type == OrderTypeSL || order.Type == OrderTypeSLM {
+		pb.orders[orderID] = &paperOrder{
+			Order: order,
+			Response: OrderStatusResponse{
+				OrderID:      orderID,
+				Status:       OrderStatusPending,
+				FilledQty:    0,
+				PendingQty:   order.Quantity,
+				AveragePrice: 0,
+				Message:      fmt.Sprintf("paper SL order (trigger=%.2f, not simulated)", order.TriggerPrice),
+				Timestamp:    time.Now(),
+			},
+		}
+		return &OrderResponse{
+			OrderID:   orderID,
+			Status:    OrderStatusPending,
+			Message:   "paper SL order placed (trigger not simulated)",
+			Timestamp: time.Now(),
+		}, nil
+	}
+
 	fillPrice := order.Price
 	if order.Type == OrderTypeMarket {
 		// In paper mode, market orders fill at the specified price.
@@ -193,4 +216,32 @@ func (pb *PaperBroker) GetOrderStatus(_ context.Context, orderID string) (*Order
 
 	resp := po.Response
 	return &resp, nil
+}
+
+// RestoreHolding injects a holding directly into the paper broker's state.
+// Used at startup to restore position state from the trades database.
+// It adjusts funds to reflect the capital deployed in restored positions.
+func (pb *PaperBroker) RestoreHolding(symbol, exchange string, quantity int, avgPrice float64) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if existing, exists := pb.holdings[symbol]; exists {
+		// Weighted average if restoring multiple trades for same symbol.
+		totalQty := existing.Quantity + quantity
+		existing.AveragePrice = (existing.AveragePrice*float64(existing.Quantity) + avgPrice*float64(quantity)) / float64(totalQty)
+		existing.Quantity = totalQty
+	} else {
+		pb.holdings[symbol] = &Holding{
+			Symbol:       symbol,
+			Exchange:     exchange,
+			Quantity:     quantity,
+			AveragePrice: avgPrice,
+			LastPrice:    avgPrice,
+		}
+	}
+
+	// Deduct from available cash to reflect deployed capital.
+	cost := avgPrice * float64(quantity)
+	pb.funds.AvailableCash -= cost
+	pb.funds.UsedMargin += cost
 }

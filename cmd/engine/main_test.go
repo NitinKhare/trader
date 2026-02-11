@@ -15,6 +15,7 @@ import (
 	"github.com/nitinkhare/algoTradingAgent/internal/market"
 	"github.com/nitinkhare/algoTradingAgent/internal/risk"
 	"github.com/nitinkhare/algoTradingAgent/internal/scheduler"
+	"github.com/nitinkhare/algoTradingAgent/internal/storage"
 	"github.com/nitinkhare/algoTradingAgent/internal/strategy"
 )
 
@@ -97,7 +98,7 @@ func runJobsDirectly(t *testing.T, cfg *config.Config,
 	t.Helper()
 	cal := market.NewCalendarFromHolidays(map[string]string{})
 	sched := scheduler.New(cal, logger)
-	registerMarketJobs(sched, cfg, b, strats, riskMgr, nil, logger)
+	registerMarketJobs(sched, cfg, b, strats, riskMgr, nil, nil, nil, logger)
 	ctx := context.Background()
 	if err := sched.ForceRunMarketHourJobs(ctx); err != nil {
 		t.Fatalf("ForceRunMarketHourJobs failed: %v", err)
@@ -438,5 +439,416 @@ func TestPaperMode_RiskRejection(t *testing.T) {
 	// Should have at most 5 positions.
 	if len(holdings) > cfg.Risk.MaxOpenPositions {
 		t.Errorf("expected max %d positions, got %d", cfg.Risk.MaxOpenPositions, len(holdings))
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Position Restore & Enrichment Tests
+// ────────────────────────────────────────────────────────────────────
+
+func TestPositionRestore_PaperBroker(t *testing.T) {
+	pb := broker.NewPaperBroker(500000)
+	ctx := context.Background()
+
+	// Simulate a trade context as if loaded from DB.
+	tc := &tradeContext{
+		trades: map[string]*storage.TradeRecord{
+			"RELIANCE": {
+				ID:         1,
+				StrategyID: "trend_follow_v1",
+				SignalID:   "sig-RELIANCE-2026-02-08",
+				Symbol:     "RELIANCE",
+				Side:       "BUY",
+				Quantity:   10,
+				EntryPrice: 2500.0,
+				StopLoss:   2400.0,
+				Target:     2700.0,
+				EntryTime:  time.Now().Add(-48 * time.Hour),
+				Status:     "open",
+			},
+		},
+	}
+
+	// Seed paper broker from trade context.
+	for _, trade := range tc.trades {
+		pb.RestoreHolding(trade.Symbol, "NSE", trade.Quantity, trade.EntryPrice)
+	}
+
+	// Verify holdings restored.
+	holdings, err := pb.GetHoldings(ctx)
+	if err != nil {
+		t.Fatalf("GetHoldings: %v", err)
+	}
+	if len(holdings) != 1 {
+		t.Fatalf("expected 1 holding, got %d", len(holdings))
+	}
+	if holdings[0].Symbol != "RELIANCE" || holdings[0].Quantity != 10 {
+		t.Errorf("unexpected holding: %+v", holdings[0])
+	}
+
+	// Verify funds were adjusted.
+	funds, _ := pb.GetFunds(ctx)
+	expectedCash := 500000.0 - (2500.0 * 10)
+	if funds.AvailableCash != expectedCash {
+		t.Errorf("expected cash %.2f, got %.2f", expectedCash, funds.AvailableCash)
+	}
+
+	// Verify enrichPosition fills all context fields.
+	pos := enrichPosition(holdings[0], tc)
+	if pos.StopLoss != 2400.0 {
+		t.Errorf("expected StopLoss 2400.0, got %.2f", pos.StopLoss)
+	}
+	if pos.Target != 2700.0 {
+		t.Errorf("expected Target 2700.0, got %.2f", pos.Target)
+	}
+	if pos.StrategyID != "trend_follow_v1" {
+		t.Errorf("expected StrategyID trend_follow_v1, got %s", pos.StrategyID)
+	}
+	if pos.SignalID != "sig-RELIANCE-2026-02-08" {
+		t.Errorf("expected SignalID, got %s", pos.SignalID)
+	}
+	// enrichPosition should use DB entry price over broker average price.
+	if pos.EntryPrice != 2500.0 {
+		t.Errorf("expected EntryPrice 2500.0, got %.2f", pos.EntryPrice)
+	}
+}
+
+func TestEnrichPosition_NilTradeContext(t *testing.T) {
+	h := broker.Holding{
+		Symbol:       "TCS",
+		Exchange:     "NSE",
+		AveragePrice: 3500.0,
+		Quantity:     5,
+	}
+
+	// With nil trade context, should return basic position info.
+	pos := enrichPosition(h, nil)
+	if pos.Symbol != "TCS" || pos.EntryPrice != 3500.0 || pos.Quantity != 5 {
+		t.Errorf("basic fields wrong: %+v", pos)
+	}
+	if pos.StopLoss != 0 || pos.Target != 0 || pos.StrategyID != "" {
+		t.Errorf("expected zero enrichment with nil context, got: sl=%.2f tgt=%.2f strat=%s",
+			pos.StopLoss, pos.Target, pos.StrategyID)
+	}
+}
+
+func TestEnrichPosition_MissingSymbol(t *testing.T) {
+	h := broker.Holding{
+		Symbol:       "UNKNOWN",
+		Exchange:     "NSE",
+		AveragePrice: 1000.0,
+		Quantity:     5,
+	}
+
+	tc := &tradeContext{
+		trades: map[string]*storage.TradeRecord{
+			"RELIANCE": {Symbol: "RELIANCE", StopLoss: 2400.0, Target: 2700.0},
+		},
+	}
+
+	// UNKNOWN is not in trade context, should return basic position info.
+	pos := enrichPosition(h, tc)
+	if pos.Symbol != "UNKNOWN" || pos.EntryPrice != 1000.0 {
+		t.Errorf("basic fields wrong: %+v", pos)
+	}
+	if pos.StopLoss != 0 || pos.Target != 0 {
+		t.Errorf("expected zero SL/target for unknown symbol, got: sl=%.2f tgt=%.2f",
+			pos.StopLoss, pos.Target)
+	}
+}
+
+func TestReconcile_NilStore_NoPanic(t *testing.T) {
+	tc := &tradeContext{
+		trades: map[string]*storage.TradeRecord{
+			"RELIANCE": {ID: 1, Symbol: "RELIANCE", Quantity: 10},
+		},
+	}
+	logger := log.New(os.Stdout, "[test-reconcile] ", log.LstdFlags)
+	ctx := context.Background()
+
+	// Should not panic with nil store.
+	reconcilePositions(ctx, nil, logger, tc, []broker.Holding{})
+
+	// Trade context should be unchanged (nil store = no-op).
+	if _, ok := tc.trades["RELIANCE"]; !ok {
+		t.Error("expected RELIANCE to remain in trade context with nil store")
+	}
+}
+
+func TestReconcile_NilTradeContext_NoPanic(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-reconcile] ", log.LstdFlags)
+	ctx := context.Background()
+
+	// Should not panic with nil trade context.
+	reconcilePositions(ctx, nil, logger, nil, []broker.Holding{
+		{Symbol: "TCS", Quantity: 5},
+	})
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Order Status Polling Tests
+// ────────────────────────────────────────────────────────────────────
+
+func TestPollOrderStatus_PaperBrokerImmediateComplete(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-poll] ", log.LstdFlags)
+	pb := broker.NewPaperBroker(100000)
+	ctx := context.Background()
+
+	// Place a regular buy order (paper broker fills immediately).
+	resp, err := pb.PlaceOrder(ctx, broker.Order{
+		Symbol: "TCS", Exchange: "NSE", Side: broker.OrderSideBuy,
+		Type: broker.OrderTypeLimit, Quantity: 5, Price: 3500.0, Product: "CNC",
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder: %v", err)
+	}
+
+	// Poll should return COMPLETED immediately (no actual polling needed).
+	status, err := pollOrderStatus(ctx, pb, resp.OrderID, 1*time.Second, 5*time.Second, logger)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if status.Status != broker.OrderStatusCompleted {
+		t.Errorf("expected COMPLETED, got %s", status.Status)
+	}
+	if status.FilledQty != 5 {
+		t.Errorf("expected FilledQty=5, got %d", status.FilledQty)
+	}
+}
+
+func TestIsTerminalOrderStatus(t *testing.T) {
+	tests := []struct {
+		status   broker.OrderStatus
+		terminal bool
+	}{
+		{broker.OrderStatusCompleted, true},
+		{broker.OrderStatusRejected, true},
+		{broker.OrderStatusCancelled, true},
+		{broker.OrderStatusPending, false},
+		{broker.OrderStatusOpen, false},
+	}
+	for _, tt := range tests {
+		if got := isTerminalOrderStatus(tt.status); got != tt.terminal {
+			t.Errorf("isTerminalOrderStatus(%s) = %v, want %v", tt.status, got, tt.terminal)
+		}
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Stop-Loss Order Tests
+// ────────────────────────────────────────────────────────────────────
+
+func TestStopLossOrder_PaperBroker(t *testing.T) {
+	pb := broker.NewPaperBroker(100000)
+	ctx := context.Background()
+
+	// Place entry order first.
+	_, err := pb.PlaceOrder(ctx, broker.Order{
+		Symbol: "TCS", Exchange: "NSE", Side: broker.OrderSideBuy,
+		Type: broker.OrderTypeLimit, Quantity: 5, Price: 3500.0, Product: "CNC",
+	})
+	if err != nil {
+		t.Fatalf("entry order failed: %v", err)
+	}
+
+	// Place SL-M order.
+	slResp, err := pb.PlaceOrder(ctx, broker.Order{
+		Symbol: "TCS", Exchange: "NSE", Side: broker.OrderSideSell,
+		Type: broker.OrderTypeSLM, Quantity: 5, TriggerPrice: 3400.0, Product: "CNC",
+	})
+	if err != nil {
+		t.Fatalf("SL order failed: %v", err)
+	}
+
+	// SL order should be PENDING (not executed in paper mode).
+	if slResp.Status != broker.OrderStatusPending {
+		t.Errorf("expected SL order status PENDING, got %s", slResp.Status)
+	}
+
+	// Holdings should still exist (SL didn't sell).
+	holdings, _ := pb.GetHoldings(ctx)
+	if len(holdings) != 1 || holdings[0].Symbol != "TCS" {
+		t.Errorf("expected TCS holding to persist after SL placement, got %v", holdings)
+	}
+
+	// GetOrderStatus should reflect PENDING.
+	slStatus, err := pb.GetOrderStatus(ctx, slResp.OrderID)
+	if err != nil {
+		t.Fatalf("GetOrderStatus: %v", err)
+	}
+	if slStatus.Status != broker.OrderStatusPending {
+		t.Errorf("expected PENDING, got %s", slStatus.Status)
+	}
+	if slStatus.PendingQty != 5 {
+		t.Errorf("expected PendingQty=5, got %d", slStatus.PendingQty)
+	}
+}
+
+func TestCancelStopLossOrder_PaperBroker(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-sl] ", log.LstdFlags)
+	pb := broker.NewPaperBroker(100000)
+	ctx := context.Background()
+
+	// Place SL order.
+	slResp, _ := pb.PlaceOrder(ctx, broker.Order{
+		Symbol: "TCS", Exchange: "NSE", Side: broker.OrderSideSell,
+		Type: broker.OrderTypeSLM, Quantity: 5, TriggerPrice: 3400.0, Product: "CNC",
+	})
+
+	// Cancel SL order.
+	ok := cancelStopLossOrder(ctx, pb, logger, slResp.OrderID, "TCS")
+	if !ok {
+		t.Error("expected cancel to succeed")
+	}
+
+	// Status should be CANCELLED.
+	status, _ := pb.GetOrderStatus(ctx, slResp.OrderID)
+	if status.Status != broker.OrderStatusCancelled {
+		t.Errorf("expected CANCELLED, got %s", status.Status)
+	}
+}
+
+func TestCancelStopLossOrder_EmptyID(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-sl] ", log.LstdFlags)
+	pb := broker.NewPaperBroker(100000)
+	ctx := context.Background()
+
+	// Empty SL order ID should return true (nothing to cancel).
+	ok := cancelStopLossOrder(ctx, pb, logger, "", "TCS")
+	if !ok {
+		t.Error("expected true for empty SL order ID")
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Daily PnL Tests
+// ────────────────────────────────────────────────────────────────────
+
+func TestCalculateDailyPnL_NilStore(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-pnl] ", log.LstdFlags)
+	ctx := context.Background()
+
+	// With nil store and nil tradeContext, should return zero PnL.
+	pnl := calculateDailyPnL(ctx, nil, nil, nil, logger)
+	if pnl.RealizedPnL != 0 || pnl.UnrealizedPnL != 0 {
+		t.Errorf("expected zero PnL with nil store, got realized=%.2f unrealized=%.2f",
+			pnl.RealizedPnL, pnl.UnrealizedPnL)
+	}
+}
+
+func TestCalculateDailyPnL_UnrealizedFromHoldings(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-pnl] ", log.LstdFlags)
+	ctx := context.Background()
+
+	// Holdings with known entry prices.
+	tc := &tradeContext{
+		trades: map[string]*storage.TradeRecord{
+			"RELIANCE": {Symbol: "RELIANCE", EntryPrice: 2500.0},
+			"TCS":      {Symbol: "TCS", EntryPrice: 3500.0},
+		},
+	}
+
+	holdings := []broker.Holding{
+		{Symbol: "RELIANCE", Quantity: 10, AveragePrice: 2500.0, LastPrice: 2600.0},
+		{Symbol: "TCS", Quantity: 5, AveragePrice: 3500.0, LastPrice: 3400.0},
+	}
+
+	pnl := calculateDailyPnL(ctx, nil, tc, holdings, logger)
+
+	// RELIANCE: 10 * (2600 - 2500) = +1000
+	// TCS: 5 * (3400 - 3500) = -500
+	// Total unrealized: +500
+	expectedUnrealized := 500.0
+	if pnl.UnrealizedPnL != expectedUnrealized {
+		t.Errorf("expected unrealized=%.2f, got %.2f", expectedUnrealized, pnl.UnrealizedPnL)
+	}
+
+	// No store means realized PnL is 0.
+	if pnl.RealizedPnL != 0 {
+		t.Errorf("expected realized=0 with nil store, got %.2f", pnl.RealizedPnL)
+	}
+}
+
+func TestCalculateDailyPnL_NoTradeContext(t *testing.T) {
+	logger := log.New(os.Stdout, "[test-pnl] ", log.LstdFlags)
+	ctx := context.Background()
+
+	// Without tradeContext, falls back to broker's AveragePrice.
+	holdings := []broker.Holding{
+		{Symbol: "INFY", Quantity: 20, AveragePrice: 1400.0, LastPrice: 1450.0},
+	}
+
+	pnl := calculateDailyPnL(ctx, nil, nil, holdings, logger)
+
+	// 20 * (1450 - 1400) = 1000
+	if pnl.UnrealizedPnL != 1000.0 {
+		t.Errorf("expected unrealized=1000.0, got %.2f", pnl.UnrealizedPnL)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// E2E: Full pipeline with SL orders
+// ────────────────────────────────────────────────────────────────────
+
+func TestPaperMode_BuyWithStopLoss(t *testing.T) {
+	tmpDir := t.TempDir()
+	aiDir := filepath.Join(tmpDir, "ai_outputs")
+	dataDir := filepath.Join(tmpDir, "market_data")
+	today := time.Now().In(market.IST).Format("2006-01-02")
+	todayDir := filepath.Join(aiDir, today)
+
+	// BULL regime.
+	regime := strategy.MarketRegimeData{
+		Date: today, Regime: strategy.RegimeBull, Confidence: 0.95,
+	}
+	writeJSON(t, filepath.Join(todayDir, "market_regime.json"), regime)
+
+	// High-scoring stock.
+	scores := []strategy.StockScore{{
+		Symbol: "SLTEST", TrendStrengthScore: 0.85, BreakoutQualityScore: 0.90,
+		VolatilityScore: 0.50, RiskScore: 0.10, LiquidityScore: 0.80,
+		CompositeScore: 0.85, Rank: 1,
+	}}
+	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
+	writeTrendingCandles(t, dataDir, "SLTEST", 50, 500.0)
+
+	cfg := &config.Config{
+		ActiveBroker: "dhan", TradingMode: config.ModePaper, Capital: 500000.0,
+		Risk: config.RiskConfig{
+			MaxRiskPerTradePct: 1.0, MaxOpenPositions: 5,
+			MaxDailyLossPct: 3.0, MaxCapitalDeploymentPct: 80.0,
+		},
+		Paths: config.PathsConfig{
+			AIOutputDir: aiDir, MarketDataDir: dataDir,
+			LogDir: filepath.Join(tmpDir, "logs"),
+		},
+		DatabaseURL:        "postgres://unused@localhost/unused?sslmode=disable",
+		MarketCalendarPath: "",
+	}
+
+	logger := log.New(os.Stdout, "[test-sl-e2e] ", log.LstdFlags)
+	pb := broker.NewPaperBroker(cfg.Capital)
+	riskMgr := risk.NewManager(cfg.Risk, cfg.Capital)
+	strats := []strategy.Strategy{strategy.NewTrendFollowStrategy(cfg.Risk)}
+
+	runJobsDirectly(t, cfg, pb, strats, riskMgr, logger)
+
+	ctx := context.Background()
+	holdings, _ := pb.GetHoldings(ctx)
+
+	// Should have bought SLTEST.
+	if len(holdings) < 1 {
+		t.Fatal("expected at least 1 holding after E2E buy")
+	}
+
+	found := false
+	for _, h := range holdings {
+		if h.Symbol == "SLTEST" {
+			found = true
+			t.Logf("SLTEST: qty=%d avg=%.2f", h.Quantity, h.AveragePrice)
+		}
+	}
+	if !found {
+		t.Error("expected SLTEST in holdings")
 	}
 }

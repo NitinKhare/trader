@@ -131,7 +131,7 @@ func (s *TrendFollowStrategy) evaluateEntry(input StrategyInput, intent TradeInt
 
 	// All entry conditions met — calculate stop loss, target, and quantity.
 	lastCandle := input.Candles[len(input.Candles)-1]
-	atr := s.calculateATR(input.Candles, 14)
+	atr := CalculateATR(input.Candles, 14)
 
 	entryPrice := lastCandle.Close
 	stopLoss := entryPrice - (atr * s.ATRStopMultiplier)
@@ -203,40 +203,8 @@ func (s *TrendFollowStrategy) evaluateExit(input StrategyInput, intent TradeInte
 	return intent
 }
 
-// calculateATR computes the Average True Range over the given period.
+// calculateATR delegates to the shared CalculateATR indicator.
+// Kept as a method for backward compatibility within the strategy.
 func (s *TrendFollowStrategy) calculateATR(candles []Candle, period int) float64 {
-	if len(candles) < period+1 {
-		// Fallback: use last candle's range.
-		last := candles[len(candles)-1]
-		return last.High - last.Low
-	}
-
-	var totalTR float64
-	for i := len(candles) - period; i < len(candles); i++ {
-		curr := candles[i]
-		prev := candles[i-1]
-
-		tr1 := curr.High - curr.Low
-		tr2 := abs(curr.High - prev.Close)
-		tr3 := abs(curr.Low - prev.Close)
-
-		tr := max(tr1, max(tr2, tr3))
-		totalTR += tr
-	}
-
-	return totalTR / float64(period)
-}
-
-func abs(x float64) float64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-func max(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
+	return CalculateATR(candles, period)
 }

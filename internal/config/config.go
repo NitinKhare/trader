@@ -47,6 +47,10 @@ type Config struct {
 
 	// Webhook server configuration for receiving broker postback notifications.
 	Webhook WebhookConfig `json:"webhook"`
+
+	// PollingIntervalMinutes controls how often market-hour jobs run during trading hours.
+	// 0 means run once and exit (backward compatible default).
+	PollingIntervalMinutes int `json:"polling_interval_minutes"`
 }
 
 // WebhookConfig holds settings for the order postback HTTP server.
@@ -75,6 +79,14 @@ type RiskConfig struct {
 
 	// MaxCapitalDeploymentPct limits how much total capital can be deployed at once.
 	MaxCapitalDeploymentPct float64 `json:"max_capital_deployment_pct"`
+
+	// MaxPerSector limits concurrent positions in the same sector.
+	// 0 means disabled (no sector limit enforced).
+	MaxPerSector int `json:"max_per_sector"`
+
+	// MaxHoldDays is the maximum calendar days a position may be held.
+	// Positions held longer are force-exited. 0 means disabled.
+	MaxHoldDays int `json:"max_hold_days"`
 }
 
 // PathsConfig defines filesystem paths for inter-layer communication.

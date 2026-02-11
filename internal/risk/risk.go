@@ -56,14 +56,25 @@ func NewManager(riskCfg config.RiskConfig, totalCapital float64) *Manager {
 	}
 }
 
+// UpdateCapital updates the capital base used for percentage-based risk calculations.
+// Called on each trading run with the live broker's total balance so that risk limits
+// automatically adjust when money is added to or withdrawn from the account.
+func (m *Manager) UpdateCapital(newCapital float64) {
+	if newCapital > 0 {
+		m.totalCapital = newCapital
+	}
+}
+
 // Validate checks a TradeIntent against all risk rules.
-// It takes the current state of open positions and daily P&L.
+// It takes the current state of open positions, daily P&L, and an optional sector map.
+// sectorMap maps symbol → sector name. Pass nil to skip sector checks.
 // Returns ValidationResult with approval status and any rejection reasons.
 func (m *Manager) Validate(
 	intent strategy.TradeIntent,
 	openPositions []strategy.PositionInfo,
 	dailyPnL DailyPnL,
 	availableCapital float64,
+	sectorMap map[string]string,
 ) ValidationResult {
 	result := ValidationResult{
 		Approved: true,
@@ -88,6 +99,7 @@ func (m *Manager) Validate(
 		m.checkMaxDailyLoss(&result, dailyPnL)
 		m.checkMaxCapitalDeployment(&result, intent, openPositions, availableCapital)
 		m.checkPositionSize(&result, intent, availableCapital)
+		m.checkSectorConcentration(&result, intent, openPositions, sectorMap)
 	}
 
 	return result
@@ -182,6 +194,35 @@ func (m *Manager) checkPositionSize(result *ValidationResult, intent strategy.Tr
 	if totalCost > availableCapital {
 		m.reject(result, "INSUFFICIENT_CAPITAL", fmt.Sprintf(
 			"trade cost %.2f exceeds available capital %.2f", totalCost, availableCapital,
+		))
+	}
+}
+
+// checkSectorConcentration ensures we don't hold too many positions in the same sector.
+// If sectorMap is nil or MaxPerSector is 0, this check is skipped (disabled).
+func (m *Manager) checkSectorConcentration(result *ValidationResult, intent strategy.TradeIntent,
+	positions []strategy.PositionInfo, sectorMap map[string]string) {
+	if sectorMap == nil || m.config.MaxPerSector <= 0 {
+		return // sector check disabled
+	}
+
+	intentSector, hasSector := sectorMap[intent.Symbol]
+	if !hasSector {
+		return // no sector info for this stock, skip check
+	}
+
+	// Count how many existing positions are in the same sector.
+	sectorCount := 0
+	for _, pos := range positions {
+		if posSector, ok := sectorMap[pos.Symbol]; ok && posSector == intentSector {
+			sectorCount++
+		}
+	}
+
+	if sectorCount >= m.config.MaxPerSector {
+		m.reject(result, "MAX_SECTOR_CONCENTRATION", fmt.Sprintf(
+			"already have %d positions in sector %s (max %d)",
+			sectorCount, intentSector, m.config.MaxPerSector,
 		))
 	}
 }

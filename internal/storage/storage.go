@@ -29,6 +29,8 @@ type TradeRecord struct {
 	ExitPrice    float64
 	StopLoss     float64
 	Target       float64
+	OrderID      string // Entry order ID from broker
+	SLOrderID    string // Stop-loss order ID from broker (SL-M type)
 	EntryTime    time.Time
 	ExitTime     *time.Time // nil if still open
 	ExitReason   string     // "stop_loss", "target", "time_exit", "strategy_invalidation", "manual"
@@ -93,6 +95,8 @@ type Store interface {
 	GetOpenTrades(ctx context.Context) ([]TradeRecord, error)
 	GetTradesByStrategy(ctx context.Context, strategyID string) ([]TradeRecord, error)
 	CloseTrade(ctx context.Context, tradeID int64, exitPrice float64, exitReason string) error
+	// UpdateTradeSLOrderID sets the stop-loss order ID for an open trade.
+	UpdateTradeSLOrderID(ctx context.Context, tradeID int64, slOrderID string) error
 
 	// Signal operations.
 	SaveSignal(ctx context.Context, signal *SignalRecord) error
@@ -105,6 +109,10 @@ type Store interface {
 	// Trade log operations.
 	SaveTradeLog(ctx context.Context, log *TradeLog) error
 	GetTradeLogs(ctx context.Context, from, to time.Time) ([]TradeLog, error)
+
+	// Analytics queries.
+	GetAllClosedTrades(ctx context.Context) ([]TradeRecord, error)
+	GetClosedTradesByDateRange(ctx context.Context, from, to time.Time) ([]TradeRecord, error)
 
 	// Daily P&L.
 	GetDailyPnL(ctx context.Context, date time.Time) (float64, error)

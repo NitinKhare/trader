@@ -166,11 +166,13 @@ func (ps *PostgresStore) SaveTrade(ctx context.Context, trade *TradeRecord) erro
 	err := ps.db.QueryRowContext(ctx,
 		`INSERT INTO trades (strategy_id, signal_id, symbol, side, quantity,
 		                     entry_price, exit_price, stop_loss, target,
+		                     order_id, sl_order_id,
 		                     entry_time, exit_time, exit_reason, pnl, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		 RETURNING id`,
 		trade.StrategyID, trade.SignalID, trade.Symbol, trade.Side, trade.Quantity,
 		trade.EntryPrice, nullFloat(trade.ExitPrice), trade.StopLoss, nullFloat(trade.Target),
+		nullString(trade.OrderID), nullString(trade.SLOrderID),
 		trade.EntryTime, nullTime(trade.ExitTime), nullString(trade.ExitReason),
 		nullFloat(trade.PnL), trade.Status,
 	).Scan(&trade.ID)
@@ -184,6 +186,7 @@ func (ps *PostgresStore) GetOpenTrades(ctx context.Context) ([]TradeRecord, erro
 	rows, err := ps.db.QueryContext(ctx,
 		`SELECT id, strategy_id, signal_id, symbol, side, quantity,
 		        entry_price, COALESCE(exit_price, 0), stop_loss, COALESCE(target, 0),
+		        COALESCE(order_id, ''), COALESCE(sl_order_id, ''),
 		        entry_time, exit_time, COALESCE(exit_reason, ''), COALESCE(pnl, 0), status, created_at
 		 FROM trades WHERE status = 'open' ORDER BY entry_time DESC`,
 	)
@@ -199,6 +202,7 @@ func (ps *PostgresStore) GetTradesByStrategy(ctx context.Context, strategyID str
 	rows, err := ps.db.QueryContext(ctx,
 		`SELECT id, strategy_id, signal_id, symbol, side, quantity,
 		        entry_price, COALESCE(exit_price, 0), stop_loss, COALESCE(target, 0),
+		        COALESCE(order_id, ''), COALESCE(sl_order_id, ''),
 		        entry_time, exit_time, COALESCE(exit_reason, ''), COALESCE(pnl, 0), status, created_at
 		 FROM trades WHERE strategy_id = $1 ORDER BY entry_time DESC`,
 		strategyID,
@@ -209,6 +213,17 @@ func (ps *PostgresStore) GetTradesByStrategy(ctx context.Context, strategyID str
 	defer rows.Close()
 
 	return scanTrades(rows)
+}
+
+func (ps *PostgresStore) UpdateTradeSLOrderID(ctx context.Context, tradeID int64, slOrderID string) error {
+	_, err := ps.db.ExecContext(ctx,
+		`UPDATE trades SET sl_order_id = $1 WHERE id = $2`,
+		slOrderID, tradeID,
+	)
+	if err != nil {
+		return fmt.Errorf("update trade sl_order_id: %w", err)
+	}
+	return nil
 }
 
 func (ps *PostgresStore) CloseTrade(ctx context.Context, tradeID int64, exitPrice float64, exitReason string) error {
@@ -349,6 +364,44 @@ func (ps *PostgresStore) GetAIScores(ctx context.Context, symbol string, date ti
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Analytics queries
+// ────────────────────────────────────────────────────────────────────
+
+func (ps *PostgresStore) GetAllClosedTrades(ctx context.Context) ([]TradeRecord, error) {
+	rows, err := ps.db.QueryContext(ctx,
+		`SELECT id, strategy_id, signal_id, symbol, side, quantity,
+		        entry_price, COALESCE(exit_price, 0), stop_loss, COALESCE(target, 0),
+		        COALESCE(order_id, ''), COALESCE(sl_order_id, ''),
+		        entry_time, exit_time, COALESCE(exit_reason, ''), COALESCE(pnl, 0), status, created_at
+		 FROM trades WHERE status = 'closed' ORDER BY exit_time ASC`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get all closed trades: %w", err)
+	}
+	defer rows.Close()
+
+	return scanTrades(rows)
+}
+
+func (ps *PostgresStore) GetClosedTradesByDateRange(ctx context.Context, from, to time.Time) ([]TradeRecord, error) {
+	rows, err := ps.db.QueryContext(ctx,
+		`SELECT id, strategy_id, signal_id, symbol, side, quantity,
+		        entry_price, COALESCE(exit_price, 0), stop_loss, COALESCE(target, 0),
+		        COALESCE(order_id, ''), COALESCE(sl_order_id, ''),
+		        entry_time, exit_time, COALESCE(exit_reason, ''), COALESCE(pnl, 0), status, created_at
+		 FROM trades WHERE status = 'closed' AND exit_time >= $1 AND exit_time <= $2
+		 ORDER BY exit_time ASC`,
+		from, to,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("get closed trades by date range: %w", err)
+	}
+	defer rows.Close()
+
+	return scanTrades(rows)
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Daily P&L
 // ────────────────────────────────────────────────────────────────────
 
@@ -376,6 +429,7 @@ func scanTrades(rows *sql.Rows) ([]TradeRecord, error) {
 		var exitTime sql.NullTime
 		if err := rows.Scan(&t.ID, &t.StrategyID, &t.SignalID, &t.Symbol, &t.Side, &t.Quantity,
 			&t.EntryPrice, &t.ExitPrice, &t.StopLoss, &t.Target,
+			&t.OrderID, &t.SLOrderID,
 			&t.EntryTime, &exitTime, &t.ExitReason, &t.PnL, &t.Status, &t.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan trade: %w", err)
 		}

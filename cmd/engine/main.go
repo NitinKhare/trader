@@ -22,10 +22,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 
+	"github.com/nitinkhare/algoTradingAgent/internal/analytics"
 	"github.com/nitinkhare/algoTradingAgent/internal/broker"
 	"github.com/nitinkhare/algoTradingAgent/internal/config"
 	"github.com/nitinkhare/algoTradingAgent/internal/market"
@@ -127,11 +130,23 @@ func main() {
 	// Initialize strategies.
 	strategies := []strategy.Strategy{
 		strategy.NewTrendFollowStrategy(cfg.Risk),
+		strategy.NewMeanReversionStrategy(cfg.Risk),
+		strategy.NewBreakoutStrategy(cfg.Risk),
+		strategy.NewMomentumStrategy(cfg.Risk),
 	}
 	logger.Printf("loaded %d strategies", len(strategies))
 
+	// Load sector map from stock universe for sector concentration checks.
+	sectorMap := loadSectorMap(logger)
+
 	// Initialize scheduler.
 	sched := scheduler.New(cal, logger)
+
+	// Load open position state from database for context recovery on restart.
+	var tc *tradeContext
+	if store != nil {
+		tc = restorePositions(context.Background(), store, activeBroker, cfg, logger)
+	}
 
 	switch *mode {
 	case "status":
@@ -173,14 +188,32 @@ func main() {
 			}()
 		}
 
-		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, logger)
-		ctx := context.Background()
-		if err := sched.RunMarketHourJobs(ctx); err != nil {
-			logger.Fatalf("market jobs failed: %v", err)
+		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, tc, sectorMap, logger)
+
+		// Set up context with signal handling for graceful shutdown.
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer cancel()
+
+		pollingInterval := time.Duration(cfg.PollingIntervalMinutes) * time.Minute
+		if pollingInterval <= 0 {
+			// Backward compatible: run once and exit.
+			logger.Println("[market] polling_interval_minutes=0 — running jobs once")
+			if err := sched.RunMarketHourJobs(ctx); err != nil {
+				logger.Fatalf("market jobs failed: %v", err)
+			}
+		} else {
+			logger.Printf("[market] continuous polling: interval=%v", pollingInterval)
+			runContinuousMarketLoop(ctx, sched, cal, pollingInterval, logger)
 		}
 
+	case "analytics":
+		runAnalytics(store, cfg, logger)
+
+	case "backtest":
+		runBacktest(cfg, strategies, riskMgr, sectorMap, logger)
+
 	default:
-		logger.Fatalf("unknown mode: %s (expected: nightly, market, status)", *mode)
+		logger.Fatalf("unknown mode: %s (expected: nightly, market, status, analytics, backtest)", *mode)
 	}
 }
 
@@ -349,6 +382,8 @@ func registerMarketJobs(
 	strategies []strategy.Strategy,
 	riskMgr *risk.Manager,
 	store *storage.PostgresStore,
+	tc *tradeContext,
+	sectorMap map[string]string,
 	logger *log.Logger,
 ) {
 	// Job: Execute pre-planned trades from watchlist.
@@ -381,6 +416,13 @@ func registerMarketJobs(
 			}
 			logger.Printf("available capital: %.2f", funds.AvailableCash)
 
+			// Update risk manager's capital base from live broker balance.
+			// This ensures risk percentages adapt when money is added/withdrawn.
+			if funds.TotalBalance > 0 {
+				riskMgr.UpdateCapital(funds.TotalBalance)
+				logger.Printf("risk capital base: %.2f", funds.TotalBalance)
+			}
+
 			// Load stock scores from JSON.
 			scoresPath := filepath.Join(cfg.Paths.AIOutputDir, today, "stock_scores.json")
 			scoresData, err := os.ReadFile(scoresPath)
@@ -406,24 +448,23 @@ func registerMarketJobs(
 				return fmt.Errorf("get holdings: %w", err)
 			}
 
-			// Build holdings map and open positions list for risk manager.
+			// Reconcile DB open trades with actual broker holdings.
+			reconcilePositions(ctx, store, logger, tc, holdings)
+
+			// Build holdings map and open positions list, enriched with DB context.
 			holdingsMap := make(map[string]broker.Holding)
 			var openPositions []strategy.PositionInfo
 			for _, h := range holdings {
 				holdingsMap[h.Symbol] = h
-				openPositions = append(openPositions, strategy.PositionInfo{
-					Symbol:     h.Symbol,
-					EntryPrice: h.AveragePrice,
-					Quantity:   h.Quantity,
-				})
+				openPositions = append(openPositions, enrichPosition(h, tc))
 			}
 			logger.Printf("existing positions: %d", len(openPositions))
 
 			// Track available capital (decremented as orders are placed).
 			availableCapital := funds.AvailableCash
 
-			// Zero daily PnL for now (will be wired to Postgres in Task 4).
-			dailyPnL := risk.DailyPnL{Date: time.Now().In(market.IST)}
+			// Calculate daily PnL from DB (realized) and holdings (unrealized).
+			dailyPnL := calculateDailyPnL(ctx, store, tc, holdings, logger)
 
 			// Core loop: iterate scored stocks, run strategies, validate, execute.
 			buyCount := 0
@@ -441,11 +482,8 @@ func registerMarketJobs(
 				// Check if we already hold this stock.
 				var currentPos *strategy.PositionInfo
 				if h, exists := holdingsMap[score.Symbol]; exists {
-					currentPos = &strategy.PositionInfo{
-						Symbol:     h.Symbol,
-						EntryPrice: h.AveragePrice,
-						Quantity:   h.Quantity,
-					}
+					enriched := enrichPosition(h, tc)
+					currentPos = &enriched
 				}
 
 				// Build strategy input.
@@ -473,7 +511,7 @@ func registerMarketJobs(
 
 					case strategy.ActionBuy:
 						// Validate through risk manager.
-						result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital)
+						result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital, sectorMap)
 						if !result.Approved {
 							for _, r := range result.Rejections {
 								logger.Printf("  %s [%s]: BUY REJECTED — %s: %s",
@@ -510,7 +548,63 @@ func registerMarketJobs(
 						logTradeAction(ctx, store, logger, "BUY_PLACED", "ORDER_PLACED",
 							fmt.Sprintf("order=%s qty=%d price=%.2f", resp.OrderID, intent.Quantity, intent.Price),
 							intent, string(regime.Regime))
-						saveTradeRecord(ctx, store, logger, intent, resp.OrderID)
+
+						// Poll order status to confirm fill before placing SL order.
+						finalStatus, pollErr := pollOrderStatus(ctx, b, resp.OrderID, 3*time.Second, 30*time.Second, logger)
+						if pollErr != nil {
+							logger.Printf("  %s: order %s poll timeout: %v — skipping SL placement",
+								score.Symbol, resp.OrderID, pollErr)
+							saveTradeRecord(ctx, store, logger, intent, resp.OrderID)
+							continue
+						}
+
+						if finalStatus.Status == broker.OrderStatusRejected {
+							logger.Printf("  %s: order %s REJECTED — %s", score.Symbol, resp.OrderID, finalStatus.Message)
+							logTradeAction(ctx, store, logger, "BUY_REJECTED_BY_BROKER", "ORDER_REJECTED",
+								fmt.Sprintf("order=%s rejected: %s", resp.OrderID, finalStatus.Message),
+								intent, string(regime.Regime))
+							continue
+						}
+
+						if finalStatus.Status != broker.OrderStatusCompleted {
+							logger.Printf("  %s: order %s not filled (status=%s) — saving without SL",
+								score.Symbol, resp.OrderID, finalStatus.Status)
+							saveTradeRecord(ctx, store, logger, intent, resp.OrderID)
+							continue
+						}
+
+						// Order FILLED — save trade and place stop-loss order.
+						logger.Printf("  %s: order %s FILLED avg=%.2f", score.Symbol, resp.OrderID, finalStatus.AveragePrice)
+						tradeID := saveTradeRecord(ctx, store, logger, intent, resp.OrderID)
+
+						// Update tradeContext so SL order ID can be tracked.
+						if tc != nil && tradeID > 0 {
+							tc.trades[intent.Symbol] = &storage.TradeRecord{
+								ID:         tradeID,
+								StrategyID: intent.StrategyID,
+								SignalID:   intent.SignalID,
+								Symbol:     intent.Symbol,
+								Side:       string(strategy.ActionBuy),
+								Quantity:   intent.Quantity,
+								EntryPrice: intent.Price,
+								StopLoss:   intent.StopLoss,
+								Target:     intent.Target,
+								OrderID:    resp.OrderID,
+								EntryTime:  time.Now(),
+								Status:     "open",
+							}
+						}
+
+						// Place SL-M order at the stop-loss price.
+						slOrderID := placeStopLossOrder(ctx, b, store, logger,
+							tradeID, intent.Symbol, "NSE", intent.Quantity, intent.StopLoss, intent.SignalID)
+
+						// Update tradeContext with SL order ID for exit cancellation.
+						if tc != nil && slOrderID != "" {
+							if trade, ok := tc.trades[intent.Symbol]; ok {
+								trade.SLOrderID = slOrderID
+							}
+						}
 
 						// Update tracking state.
 						availableCapital -= intent.Price * float64(intent.Quantity)
@@ -528,11 +622,18 @@ func registerMarketJobs(
 
 					case strategy.ActionExit:
 						// Validate through risk manager (exits always pass).
-						result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital)
+						result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital, sectorMap)
 						if !result.Approved {
 							logger.Printf("  %s [%s]: EXIT REJECTED (unexpected) — %v",
 								score.Symbol, strat.ID(), result.Rejections)
 							continue
+						}
+
+						// Cancel existing SL order before placing exit (prevents double sell).
+						if tc != nil {
+							if trade, ok := tc.trades[intent.Symbol]; ok && trade.SLOrderID != "" {
+								cancelStopLossOrder(ctx, b, logger, trade.SLOrderID, intent.Symbol)
+							}
 						}
 
 						order := broker.Order{
@@ -560,6 +661,9 @@ func registerMarketJobs(
 						logTradeAction(ctx, store, logger, "EXIT_PLACED", "ORDER_PLACED",
 							fmt.Sprintf("order=%s qty=%d price=%.2f reason=%s", resp.OrderID, intent.Quantity, intent.Price, intent.Reason),
 							intent, string(regime.Regime))
+
+						// Mark trade as closed in the database.
+						closeTradeRecord(ctx, store, logger, tc, intent.Symbol, intent.Price, intent.Reason)
 					}
 				}
 			}
@@ -619,17 +723,14 @@ func registerMarketJobs(
 				scoreMap[s.Symbol] = s
 			}
 
-			// Build open positions list for risk manager.
+			// Build open positions list, enriched with DB context.
 			var openPositions []strategy.PositionInfo
 			for _, h := range holdings {
-				openPositions = append(openPositions, strategy.PositionInfo{
-					Symbol:     h.Symbol,
-					EntryPrice: h.AveragePrice,
-					Quantity:   h.Quantity,
-				})
+				openPositions = append(openPositions, enrichPosition(h, tc))
 			}
 
-			dailyPnL := risk.DailyPnL{Date: time.Now().In(market.IST)}
+			// Calculate daily PnL from DB (realized) and holdings (unrealized).
+			dailyPnL := calculateDailyPnL(ctx, store, tc, holdings, logger)
 			funds, err := b.GetFunds(ctx)
 			if err != nil {
 				return fmt.Errorf("get funds for exit monitoring: %w", err)
@@ -639,6 +740,48 @@ func registerMarketJobs(
 			for _, h := range holdings {
 				logger.Printf("  checking %s: qty=%d avg=%.2f last=%.2f pnl=%.2f",
 					h.Symbol, h.Quantity, h.AveragePrice, h.LastPrice, h.PnL)
+
+				// Max holding period check: force exit if held too long.
+				if cfg.Risk.MaxHoldDays > 0 && tc != nil {
+					if trade, ok := tc.trades[h.Symbol]; ok {
+						holdDays := int(time.Since(trade.EntryTime).Hours() / 24)
+						if holdDays >= cfg.Risk.MaxHoldDays {
+							logger.Printf("  %s: max hold period %d days exceeded (held %d days) — forcing exit",
+								h.Symbol, cfg.Risk.MaxHoldDays, holdDays)
+
+							// Cancel SL order.
+							if trade.SLOrderID != "" {
+								cancelStopLossOrder(ctx, b, logger, trade.SLOrderID, h.Symbol)
+							}
+
+							// Place exit order.
+							exitPrice := h.LastPrice
+							if exitPrice == 0 {
+								exitPrice = h.AveragePrice
+							}
+							exitOrder := broker.Order{
+								Symbol:   h.Symbol,
+								Exchange: "NSE",
+								Side:     broker.OrderSideSell,
+								Type:     broker.OrderTypeLimit,
+								Quantity: h.Quantity,
+								Price:    exitPrice,
+								Product:  "CNC",
+								Tag:      "max-hold-exit",
+							}
+							resp, err := b.PlaceOrder(ctx, exitOrder)
+							if err != nil {
+								logger.Printf("  %s: MAX HOLD EXIT ORDER FAILED — %v", h.Symbol, err)
+							} else {
+								logger.Printf("  %s: MAX HOLD EXIT ORDER PLACED — id=%s price=%.2f (held %d days)",
+									h.Symbol, resp.OrderID, exitPrice, holdDays)
+								closeTradeRecord(ctx, store, logger, tc, h.Symbol, exitPrice, "max_hold_period")
+								exitCount++
+							}
+							continue // skip strategy eval for this holding
+						}
+					}
+				}
 
 				// Find score for this holding.
 				score, hasScore := scoreMap[h.Symbol]
@@ -651,19 +794,15 @@ func registerMarketJobs(
 				csvPath := filepath.Join(cfg.Paths.MarketDataDir, h.Symbol+".csv")
 				candles := market.LoadExistingCSV(csvPath)
 
-				// Build strategy input with CurrentPosition set (triggers exit path).
-				currentPos := &strategy.PositionInfo{
-					Symbol:     h.Symbol,
-					EntryPrice: h.AveragePrice,
-					Quantity:   h.Quantity,
-				}
+				// Build strategy input with CurrentPosition enriched from DB.
+				enriched := enrichPosition(h, tc)
 
 				input := strategy.StrategyInput{
 					Date:              time.Now().In(market.IST),
 					Regime:            regime,
 					Score:             score,
 					Candles:           candles,
-					CurrentPosition:   currentPos,
+					CurrentPosition:   &enriched,
 					OpenPositionCount: len(openPositions),
 					AvailableCapital:  funds.AvailableCash,
 				}
@@ -674,11 +813,18 @@ func registerMarketJobs(
 
 					if intent.Action == strategy.ActionExit {
 						// Validate (exits always pass risk checks).
-						result := riskMgr.Validate(intent, openPositions, dailyPnL, funds.AvailableCash)
+						result := riskMgr.Validate(intent, openPositions, dailyPnL, funds.AvailableCash, sectorMap)
 						if !result.Approved {
 							logger.Printf("  %s [%s]: EXIT REJECTED (unexpected) — %v",
 								h.Symbol, strat.ID(), result.Rejections)
 							continue
+						}
+
+						// Cancel existing SL order before placing exit (prevents double sell).
+						if tc != nil {
+							if trade, ok := tc.trades[h.Symbol]; ok && trade.SLOrderID != "" {
+								cancelStopLossOrder(ctx, b, logger, trade.SLOrderID, h.Symbol)
+							}
 						}
 
 						order := broker.Order{
@@ -706,6 +852,9 @@ func registerMarketJobs(
 						logTradeAction(ctx, store, logger, "EXIT_PLACED", "ORDER_PLACED",
 							fmt.Sprintf("order=%s qty=%d price=%.2f reason=%s", resp.OrderID, intent.Quantity, intent.Price, intent.Reason),
 							intent, string(regime.Regime))
+
+						// Mark trade as closed in the database.
+						closeTradeRecord(ctx, store, logger, tc, h.Symbol, intent.Price, intent.Reason)
 						exitCount++
 
 					} else if intent.Action == strategy.ActionHold {
@@ -744,11 +893,12 @@ func logTradeAction(ctx context.Context, store *storage.PostgresStore, logger *l
 }
 
 // saveTradeRecord persists a new open trade to the database if the store is available.
+// Returns the trade ID (used for linking SL orders), or 0 if DB is unavailable.
 func saveTradeRecord(ctx context.Context, store *storage.PostgresStore, logger *log.Logger,
 	intent strategy.TradeIntent, orderID string,
-) {
+) int64 {
 	if store == nil {
-		return
+		return 0
 	}
 	trade := &storage.TradeRecord{
 		StrategyID: intent.StrategyID,
@@ -759,10 +909,810 @@ func saveTradeRecord(ctx context.Context, store *storage.PostgresStore, logger *
 		EntryPrice: intent.Price,
 		StopLoss:   intent.StopLoss,
 		Target:     intent.Target,
+		OrderID:    orderID,
 		EntryTime:  time.Now(),
 		Status:     "open",
 	}
 	if err := store.SaveTrade(ctx, trade); err != nil {
 		logger.Printf("[db] failed to save trade: %v", err)
+		return 0
 	}
+	logger.Printf("[db] saved trade: id=%d symbol=%s order_id=%s", trade.ID, trade.Symbol, orderID)
+	return trade.ID
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Position persistence and reconciliation
+// ────────────────────────────────────────────────────────────────────
+
+// tradeContext maps symbol to its open TradeRecord from the DB.
+// This provides the full entry context (stop loss, target, strategy ID, etc.)
+// that is lost when the engine restarts.
+type tradeContext struct {
+	trades map[string]*storage.TradeRecord // symbol -> open trade
+}
+
+// loadTradeContext loads open trades from the database and returns a lookup structure.
+// Returns nil if the store is not available (graceful degradation).
+func loadTradeContext(ctx context.Context, store *storage.PostgresStore, logger *log.Logger) *tradeContext {
+	if store == nil {
+		return nil
+	}
+
+	openTrades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		logger.Printf("[positions] WARNING: failed to load open trades from DB: %v", err)
+		return nil
+	}
+
+	tc := &tradeContext{
+		trades: make(map[string]*storage.TradeRecord, len(openTrades)),
+	}
+	for i := range openTrades {
+		t := &openTrades[i]
+		tc.trades[t.Symbol] = t
+		logger.Printf("[positions] restored: %s strategy=%s entry=%.2f sl=%.2f tgt=%.2f qty=%d",
+			t.Symbol, t.StrategyID, t.EntryPrice, t.StopLoss, t.Target, t.Quantity)
+	}
+
+	logger.Printf("[positions] loaded %d open trades from database", len(tc.trades))
+	return tc
+}
+
+// enrichPosition creates a fully populated PositionInfo by merging
+// broker holding data with trade context from the database.
+// If no DB context exists for a symbol, returns a PositionInfo with only
+// broker-sourced fields (current behavior, graceful degradation).
+func enrichPosition(h broker.Holding, tc *tradeContext) strategy.PositionInfo {
+	pos := strategy.PositionInfo{
+		Symbol:     h.Symbol,
+		EntryPrice: h.AveragePrice,
+		Quantity:   h.Quantity,
+	}
+
+	if tc == nil {
+		return pos
+	}
+
+	if trade, ok := tc.trades[h.Symbol]; ok {
+		pos.StopLoss = trade.StopLoss
+		pos.Target = trade.Target
+		pos.StrategyID = trade.StrategyID
+		pos.SignalID = trade.SignalID
+		pos.EntryTime = trade.EntryTime
+		// Use the DB entry price as the authoritative entry price.
+		// Broker's AveragePrice may differ slightly due to fill slippage.
+		pos.EntryPrice = trade.EntryPrice
+	}
+
+	return pos
+}
+
+// reconcilePositions compares DB open trades with actual broker holdings
+// and handles discrepancies:
+//   - Position in DB but not in broker -> close the DB trade (manually sold/stopped out)
+//   - Position in broker but not in DB -> log warning (opened outside engine)
+//   - Quantity mismatch -> log warning (partial close)
+func reconcilePositions(
+	ctx context.Context,
+	store *storage.PostgresStore,
+	logger *log.Logger,
+	tc *tradeContext,
+	holdings []broker.Holding,
+) {
+	if store == nil || tc == nil {
+		return
+	}
+
+	// Build holdings lookup.
+	holdingsMap := make(map[string]broker.Holding, len(holdings))
+	for _, h := range holdings {
+		holdingsMap[h.Symbol] = h
+	}
+
+	// Check each DB open trade against broker holdings.
+	for symbol, trade := range tc.trades {
+		h, brokerHasIt := holdingsMap[symbol]
+		if !brokerHasIt {
+			// Position was closed outside the engine (manual sell, broker-side SL, etc.)
+			logger.Printf("[reconcile] %s: DB has open trade (id=%d) but broker has no holding — marking as closed (external_close)",
+				symbol, trade.ID)
+			if err := store.CloseTrade(ctx, trade.ID, 0, "external_close"); err != nil {
+				logger.Printf("[reconcile] WARNING: failed to close trade %d: %v", trade.ID, err)
+			}
+			delete(tc.trades, symbol)
+			continue
+		}
+
+		// Quantity mismatch: partial close outside engine.
+		if h.Quantity != trade.Quantity {
+			logger.Printf("[reconcile] %s: quantity mismatch — DB=%d broker=%d (partial close detected)",
+				symbol, trade.Quantity, h.Quantity)
+		}
+	}
+
+	// Check for positions in broker but not in DB.
+	for symbol := range holdingsMap {
+		if _, inDB := tc.trades[symbol]; !inDB {
+			logger.Printf("[reconcile] %s: broker has holding but no open trade in DB — position lacks SL/target context",
+				symbol)
+		}
+	}
+}
+
+// restorePositions loads open trades from the DB and:
+//  1. Builds a tradeContext for enriching PositionInfo throughout the engine.
+//  2. Seeds the paper broker with restored holdings (if paper mode).
+//
+// Returns the tradeContext, or nil if DB is unavailable.
+func restorePositions(
+	ctx context.Context,
+	store *storage.PostgresStore,
+	b broker.Broker,
+	cfg *config.Config,
+	logger *log.Logger,
+) *tradeContext {
+	tc := loadTradeContext(ctx, store, logger)
+	if tc == nil || len(tc.trades) == 0 {
+		return tc
+	}
+
+	// For paper mode, seed the paper broker with restored holdings.
+	if cfg.TradingMode == config.ModePaper {
+		if pb, ok := b.(*broker.PaperBroker); ok {
+			for _, trade := range tc.trades {
+				pb.RestoreHolding(trade.Symbol, "NSE", trade.Quantity, trade.EntryPrice)
+				logger.Printf("[positions] seeded paper broker: %s qty=%d price=%.2f",
+					trade.Symbol, trade.Quantity, trade.EntryPrice)
+			}
+		}
+	}
+
+	return tc
+}
+
+// closeTradeRecord marks a trade as closed in the database after an exit order.
+func closeTradeRecord(
+	ctx context.Context,
+	store *storage.PostgresStore,
+	logger *log.Logger,
+	tc *tradeContext,
+	symbol string,
+	exitPrice float64,
+	exitReason string,
+) {
+	if store == nil || tc == nil {
+		return
+	}
+	trade, ok := tc.trades[symbol]
+	if !ok {
+		return
+	}
+	if err := store.CloseTrade(ctx, trade.ID, exitPrice, exitReason); err != nil {
+		logger.Printf("[db] failed to close trade %d: %v", trade.ID, err)
+	} else {
+		logger.Printf("[db] trade %d closed: %s exit=%.2f reason=%s",
+			trade.ID, symbol, exitPrice, exitReason)
+		delete(tc.trades, symbol)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Order status polling (Feature 2)
+// ────────────────────────────────────────────────────────────────────
+
+// pollOrderStatus polls GetOrderStatus until the order reaches a terminal state
+// (COMPLETED, REJECTED, CANCELLED) or the timeout expires.
+// Paper broker returns COMPLETED immediately, making this a no-op in paper mode.
+func pollOrderStatus(
+	ctx context.Context,
+	b broker.Broker,
+	orderID string,
+	pollInterval time.Duration,
+	maxDuration time.Duration,
+	logger *log.Logger,
+) (*broker.OrderStatusResponse, error) {
+	// Immediate first check.
+	status, err := b.GetOrderStatus(ctx, orderID)
+	if err != nil {
+		return nil, fmt.Errorf("poll order %s: %w", orderID, err)
+	}
+	if isTerminalOrderStatus(status.Status) {
+		return status, nil
+	}
+
+	// Poll until terminal or timeout.
+	deadline := time.Now().Add(maxDuration)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return status, ctx.Err()
+		case <-ticker.C:
+			if time.Now().After(deadline) {
+				logger.Printf("[order-poll] %s: timeout (%v), last=%s filled=%d/%d",
+					orderID, maxDuration, status.Status, status.FilledQty, status.FilledQty+status.PendingQty)
+				return status, fmt.Errorf("order %s poll timeout after %v", orderID, maxDuration)
+			}
+			status, err = b.GetOrderStatus(ctx, orderID)
+			if err != nil {
+				logger.Printf("[order-poll] %s: check failed: %v", orderID, err)
+				continue // transient error, keep polling
+			}
+			logger.Printf("[order-poll] %s: %s filled=%d avg=%.2f",
+				orderID, status.Status, status.FilledQty, status.AveragePrice)
+			if isTerminalOrderStatus(status.Status) {
+				return status, nil
+			}
+		}
+	}
+}
+
+// isTerminalOrderStatus returns true if the order has reached a final state.
+func isTerminalOrderStatus(s broker.OrderStatus) bool {
+	return s == broker.OrderStatusCompleted ||
+		s == broker.OrderStatusRejected ||
+		s == broker.OrderStatusCancelled
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Stop-loss order management (Feature 1)
+// ────────────────────────────────────────────────────────────────────
+
+// placeStopLossOrder places a SL-M (stop-loss market) sell order after an entry fill.
+// Updates the trade record in the database with the SL order ID.
+// Returns the SL order ID on success, or empty string on failure.
+func placeStopLossOrder(
+	ctx context.Context,
+	b broker.Broker,
+	store *storage.PostgresStore,
+	logger *log.Logger,
+	tradeID int64,
+	symbol, exchange string,
+	quantity int,
+	stopLossPrice float64,
+	signalID string,
+) string {
+	slOrder := broker.Order{
+		Symbol:       symbol,
+		Exchange:     exchange,
+		Side:         broker.OrderSideSell,
+		Type:         broker.OrderTypeSLM,
+		Quantity:     quantity,
+		Price:        0, // Market order on trigger
+		TriggerPrice: stopLossPrice,
+		Product:      "CNC",
+		Tag:          signalID + "-SL",
+	}
+
+	logger.Printf("[sl-order] placing SL-M for %s: qty=%d trigger=%.2f", symbol, quantity, stopLossPrice)
+
+	resp, err := b.PlaceOrder(ctx, slOrder)
+	if err != nil {
+		logger.Printf("[sl-order] FAILED for %s: %v", symbol, err)
+		return ""
+	}
+
+	logger.Printf("[sl-order] placed for %s: order_id=%s status=%s trigger=%.2f",
+		symbol, resp.OrderID, resp.Status, stopLossPrice)
+
+	// Persist SL order ID in the trade record.
+	if store != nil && tradeID > 0 {
+		if err := store.UpdateTradeSLOrderID(ctx, tradeID, resp.OrderID); err != nil {
+			logger.Printf("[sl-order] WARNING: failed to save sl_order_id for trade %d: %v", tradeID, err)
+		}
+	}
+
+	return resp.OrderID
+}
+
+// cancelStopLossOrder cancels an existing SL order before placing a strategy exit.
+// Returns true if the cancel succeeded or there was nothing to cancel.
+func cancelStopLossOrder(
+	ctx context.Context,
+	b broker.Broker,
+	logger *log.Logger,
+	slOrderID string,
+	symbol string,
+) bool {
+	if slOrderID == "" {
+		return true
+	}
+	logger.Printf("[sl-order] canceling %s for %s before exit", slOrderID, symbol)
+	if err := b.CancelOrder(ctx, slOrderID); err != nil {
+		logger.Printf("[sl-order] WARNING: cancel %s failed: %v — proceeding with exit", slOrderID, err)
+		return false
+	}
+	logger.Printf("[sl-order] canceled %s for %s", slOrderID, symbol)
+	return true
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Daily PnL calculation (Feature 4)
+// ────────────────────────────────────────────────────────────────────
+
+// calculateDailyPnL computes realized and unrealized PnL for today.
+// Realized: from closed trades in the DB (store.GetDailyPnL).
+// Unrealized: from current holdings vs entry prices (using tradeContext).
+func calculateDailyPnL(
+	ctx context.Context,
+	store *storage.PostgresStore,
+	tc *tradeContext,
+	holdings []broker.Holding,
+	logger *log.Logger,
+) risk.DailyPnL {
+	today := time.Now().In(market.IST)
+	pnl := risk.DailyPnL{Date: today}
+
+	// Realized PnL from closed trades today.
+	if store != nil {
+		realized, err := store.GetDailyPnL(ctx, today)
+		if err != nil {
+			logger.Printf("[pnl] WARNING: realized PnL query failed: %v", err)
+		} else {
+			pnl.RealizedPnL = realized
+		}
+	}
+
+	// Unrealized PnL from open holdings.
+	for _, h := range holdings {
+		entryPrice := h.AveragePrice
+		if tc != nil {
+			if trade, ok := tc.trades[h.Symbol]; ok {
+				entryPrice = trade.EntryPrice
+			}
+		}
+		pnl.UnrealizedPnL += float64(h.Quantity) * (h.LastPrice - entryPrice)
+	}
+
+	if pnl.RealizedPnL != 0 || pnl.UnrealizedPnL != 0 {
+		logger.Printf("[pnl] realized=%.2f unrealized=%.2f total=%.2f",
+			pnl.RealizedPnL, pnl.UnrealizedPnL, pnl.RealizedPnL+pnl.UnrealizedPnL)
+	}
+
+	return pnl
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Continuous market-hour polling (Feature 3)
+// ────────────────────────────────────────────────────────────────────
+
+// runContinuousMarketLoop runs market-hour jobs repeatedly during trading hours.
+// Exits when the market closes or the context is cancelled (SIGINT/SIGTERM).
+func runContinuousMarketLoop(
+	ctx context.Context,
+	sched *scheduler.Scheduler,
+	cal *market.Calendar,
+	interval time.Duration,
+	logger *log.Logger,
+) {
+	// Run immediately on startup if market is open.
+	if cal.IsMarketOpen(time.Now()) {
+		logger.Println("[market-loop] initial run...")
+		if err := sched.RunMarketHourJobs(ctx); err != nil {
+			logger.Printf("[market-loop] initial run failed: %v", err)
+		}
+	} else {
+		logger.Println("[market-loop] market is currently closed, waiting for open...")
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Println("[market-loop] shutdown signal received, exiting")
+			return
+		case <-ticker.C:
+			now := time.Now()
+			if !cal.IsMarketOpen(now) {
+				logger.Printf("[market-loop] market closed at %s — exiting loop",
+					now.In(market.IST).Format("15:04:05"))
+				return
+			}
+			logger.Printf("[market-loop] running jobs at %s...",
+				now.In(market.IST).Format("15:04:05"))
+			if err := sched.RunMarketHourJobs(ctx); err != nil {
+				logger.Printf("[market-loop] jobs failed: %v", err)
+			}
+		}
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Sector map loading
+// ────────────────────────────────────────────────────────────────────
+
+// loadSectorMap reads sector information from stock_universe.json.
+// Returns nil (not an error) if the file doesn't exist or lacks sector data.
+func loadSectorMap(logger *log.Logger) map[string]string {
+	data, err := os.ReadFile("config/stock_universe.json")
+	if err != nil {
+		logger.Printf("[sectors] WARNING: cannot load stock_universe.json: %v — sector limits disabled", err)
+		return nil
+	}
+
+	var universe struct {
+		Stocks []struct {
+			Symbol string `json:"symbol"`
+			Sector string `json:"sector"`
+		} `json:"stocks"`
+	}
+	if err := json.Unmarshal(data, &universe); err != nil {
+		logger.Printf("[sectors] WARNING: cannot parse stock_universe.json: %v — sector limits disabled", err)
+		return nil
+	}
+
+	if len(universe.Stocks) == 0 {
+		return nil
+	}
+
+	sectorMap := make(map[string]string, len(universe.Stocks))
+	for _, s := range universe.Stocks {
+		if s.Symbol != "" && s.Sector != "" {
+			sectorMap[s.Symbol] = s.Sector
+		}
+	}
+
+	logger.Printf("[sectors] loaded sector map: %d stocks", len(sectorMap))
+	return sectorMap
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Analytics mode
+// ────────────────────────────────────────────────────────────────────
+
+// runAnalytics loads all closed trades from the database and prints a performance report.
+func runAnalytics(store *storage.PostgresStore, cfg *config.Config, logger *log.Logger) {
+	if store == nil {
+		logger.Fatal("[analytics] database is required for analytics mode")
+	}
+
+	ctx := context.Background()
+	trades, err := store.GetAllClosedTrades(ctx)
+	if err != nil {
+		logger.Fatalf("[analytics] failed to load closed trades: %v", err)
+	}
+
+	logger.Printf("[analytics] loaded %d closed trades", len(trades))
+
+	report := analytics.Analyze(trades, cfg.Capital)
+	fmt.Println(analytics.FormatReport(report))
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Backtest mode
+// ────────────────────────────────────────────────────────────────────
+
+// backtestPosition tracks a virtual open position during backtesting.
+type backtestPosition struct {
+	symbol     string
+	entryPrice float64
+	quantity   int
+	stopLoss   float64
+	target     float64
+	strategyID string
+	entryDate  time.Time
+}
+
+// runBacktest runs strategies against historical data to validate before going live.
+// It iterates day-by-day through available AI outputs and market data.
+func runBacktest(
+	cfg *config.Config,
+	strategies []strategy.Strategy,
+	riskMgr *risk.Manager,
+	sectorMap map[string]string,
+	logger *log.Logger,
+) {
+	logger.Println("[backtest] starting backtest run...")
+
+	// Scan ai_outputs directory for available dates.
+	aiDir := cfg.Paths.AIOutputDir
+	entries, err := os.ReadDir(aiDir)
+	if err != nil {
+		logger.Fatalf("[backtest] cannot read AI outputs dir %s: %v", aiDir, err)
+	}
+
+	// Collect dates that have both regime and scores.
+	var dates []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		dateStr := entry.Name()
+		regimePath := filepath.Join(aiDir, dateStr, "market_regime.json")
+		scoresPath := filepath.Join(aiDir, dateStr, "stock_scores.json")
+		if _, err := os.Stat(regimePath); err == nil {
+			if _, err := os.Stat(scoresPath); err == nil {
+				dates = append(dates, dateStr)
+			}
+		}
+	}
+
+	sort.Strings(dates)
+
+	if len(dates) == 0 {
+		logger.Fatal("[backtest] no AI output data found — run nightly pipeline first")
+	}
+
+	logger.Printf("[backtest] found %d trading days with AI data: %s to %s",
+		len(dates), dates[0], dates[len(dates)-1])
+
+	// Virtual state.
+	positions := make(map[string]*backtestPosition)
+	var closedTrades []storage.TradeRecord
+	capital := cfg.Capital
+	tradeCounter := int64(0)
+
+	for _, dateStr := range dates {
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			continue
+		}
+
+		// Load regime.
+		regimePath := filepath.Join(aiDir, dateStr, "market_regime.json")
+		regimeData, err := os.ReadFile(regimePath)
+		if err != nil {
+			continue
+		}
+		var regime strategy.MarketRegimeData
+		if err := json.Unmarshal(regimeData, &regime); err != nil {
+			continue
+		}
+
+		// Load scores.
+		scoresPath := filepath.Join(aiDir, dateStr, "stock_scores.json")
+		scoresData, err := os.ReadFile(scoresPath)
+		if err != nil {
+			continue
+		}
+		var scores []strategy.StockScore
+		if err := json.Unmarshal(scoresData, &scores); err != nil {
+			continue
+		}
+
+		sort.Slice(scores, func(i, j int) bool {
+			return scores[i].Rank < scores[j].Rank
+		})
+
+		// Build open positions list for risk manager.
+		var openPositions []strategy.PositionInfo
+		for _, pos := range positions {
+			openPositions = append(openPositions, strategy.PositionInfo{
+				Symbol:     pos.symbol,
+				EntryPrice: pos.entryPrice,
+				Quantity:   pos.quantity,
+				StopLoss:   pos.stopLoss,
+				Target:     pos.target,
+				StrategyID: pos.strategyID,
+				EntryTime:  pos.entryDate,
+			})
+		}
+
+		availableCapital := capital
+		for _, pos := range positions {
+			availableCapital -= pos.entryPrice * float64(pos.quantity)
+		}
+		if availableCapital < 0 {
+			availableCapital = 0
+		}
+
+		dailyPnL := risk.DailyPnL{Date: date}
+
+		for _, score := range scores {
+			// Load candle data.
+			csvPath := filepath.Join(cfg.Paths.MarketDataDir, score.Symbol+".csv")
+			candles := market.LoadExistingCSV(csvPath)
+			if len(candles) == 0 {
+				continue
+			}
+
+			// Filter candles up to this date.
+			var candlesUpToDate []strategy.Candle
+			for _, c := range candles {
+				if !c.Date.After(date) {
+					candlesUpToDate = append(candlesUpToDate, c)
+				}
+			}
+			if len(candlesUpToDate) == 0 {
+				continue
+			}
+
+			// Check existing position.
+			var currentPos *strategy.PositionInfo
+			if pos, exists := positions[score.Symbol]; exists {
+				cp := strategy.PositionInfo{
+					Symbol:     pos.symbol,
+					EntryPrice: pos.entryPrice,
+					Quantity:   pos.quantity,
+					StopLoss:   pos.stopLoss,
+					Target:     pos.target,
+					StrategyID: pos.strategyID,
+					EntryTime:  pos.entryDate,
+				}
+				currentPos = &cp
+			}
+
+			input := strategy.StrategyInput{
+				Date:              date,
+				Regime:            regime,
+				Score:             score,
+				Candles:           candlesUpToDate,
+				CurrentPosition:   currentPos,
+				OpenPositionCount: len(positions),
+				AvailableCapital:  availableCapital,
+			}
+
+			for _, strat := range strategies {
+				intent := strat.Evaluate(input)
+
+				switch intent.Action {
+				case strategy.ActionBuy:
+					if _, alreadyHeld := positions[intent.Symbol]; alreadyHeld {
+						continue
+					}
+					result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital, sectorMap)
+					if !result.Approved {
+						continue
+					}
+
+					positions[intent.Symbol] = &backtestPosition{
+						symbol:     intent.Symbol,
+						entryPrice: intent.Price,
+						quantity:   intent.Quantity,
+						stopLoss:   intent.StopLoss,
+						target:     intent.Target,
+						strategyID: intent.StrategyID,
+						entryDate:  date,
+					}
+					availableCapital -= intent.Price * float64(intent.Quantity)
+					openPositions = append(openPositions, strategy.PositionInfo{
+						Symbol:     intent.Symbol,
+						EntryPrice: intent.Price,
+						Quantity:   intent.Quantity,
+						StopLoss:   intent.StopLoss,
+						Target:     intent.Target,
+						StrategyID: intent.StrategyID,
+						EntryTime:  date,
+					})
+					tradeCounter++
+
+				case strategy.ActionExit:
+					pos, exists := positions[intent.Symbol]
+					if !exists {
+						continue
+					}
+					exitPrice := intent.Price
+					if exitPrice == 0 && len(candlesUpToDate) > 0 {
+						exitPrice = candlesUpToDate[len(candlesUpToDate)-1].Close
+					}
+					pnl := float64(pos.quantity) * (exitPrice - pos.entryPrice)
+					exitTime := date
+					closedTrades = append(closedTrades, storage.TradeRecord{
+						ID:         tradeCounter,
+						StrategyID: pos.strategyID,
+						Symbol:     pos.symbol,
+						Side:       string(strategy.ActionBuy),
+						Quantity:   pos.quantity,
+						EntryPrice: pos.entryPrice,
+						ExitPrice:  exitPrice,
+						StopLoss:   pos.stopLoss,
+						Target:     pos.target,
+						EntryTime:  pos.entryDate,
+						ExitTime:   &exitTime,
+						ExitReason: intent.Reason,
+						PnL:        pnl,
+						Status:     "closed",
+					})
+					delete(positions, intent.Symbol)
+				}
+			}
+
+			// Check SL/target hits on existing positions using today's candle data.
+			if pos, exists := positions[score.Symbol]; exists {
+				lastCandle := candlesUpToDate[len(candlesUpToDate)-1]
+
+				var exitPrice float64
+				var exitReason string
+
+				if lastCandle.Low <= pos.stopLoss {
+					exitPrice = pos.stopLoss
+					exitReason = "stop_loss"
+				} else if pos.target > 0 && lastCandle.High >= pos.target {
+					exitPrice = pos.target
+					exitReason = "target"
+				}
+
+				if exitReason != "" {
+					pnl := float64(pos.quantity) * (exitPrice - pos.entryPrice)
+					exitTime := date
+					closedTrades = append(closedTrades, storage.TradeRecord{
+						ID:         tradeCounter,
+						StrategyID: pos.strategyID,
+						Symbol:     pos.symbol,
+						Side:       string(strategy.ActionBuy),
+						Quantity:   pos.quantity,
+						EntryPrice: pos.entryPrice,
+						ExitPrice:  exitPrice,
+						StopLoss:   pos.stopLoss,
+						Target:     pos.target,
+						EntryTime:  pos.entryDate,
+						ExitTime:   &exitTime,
+						ExitReason: exitReason,
+						PnL:        pnl,
+						Status:     "closed",
+					})
+					delete(positions, score.Symbol)
+				}
+			}
+
+			// Max hold period check.
+			if cfg.Risk.MaxHoldDays > 0 {
+				if pos, exists := positions[score.Symbol]; exists {
+					holdDays := int(date.Sub(pos.entryDate).Hours() / 24)
+					if holdDays >= cfg.Risk.MaxHoldDays {
+						exitPrice := candlesUpToDate[len(candlesUpToDate)-1].Close
+						pnl := float64(pos.quantity) * (exitPrice - pos.entryPrice)
+						exitTime := date
+						closedTrades = append(closedTrades, storage.TradeRecord{
+							ID:         tradeCounter,
+							StrategyID: pos.strategyID,
+							Symbol:     pos.symbol,
+							Side:       string(strategy.ActionBuy),
+							Quantity:   pos.quantity,
+							EntryPrice: pos.entryPrice,
+							ExitPrice:  exitPrice,
+							StopLoss:   pos.stopLoss,
+							Target:     pos.target,
+							EntryTime:  pos.entryDate,
+							ExitTime:   &exitTime,
+							ExitReason: "max_hold_period",
+							PnL:        pnl,
+							Status:     "closed",
+						})
+						delete(positions, score.Symbol)
+					}
+				}
+			}
+		}
+	}
+
+	// Close any remaining open positions at last known price.
+	for symbol, pos := range positions {
+		csvPath := filepath.Join(cfg.Paths.MarketDataDir, symbol+".csv")
+		candles := market.LoadExistingCSV(csvPath)
+		exitPrice := pos.entryPrice // fallback
+		if len(candles) > 0 {
+			exitPrice = candles[len(candles)-1].Close
+		}
+		pnl := float64(pos.quantity) * (exitPrice - pos.entryPrice)
+		lastDate := time.Now()
+		closedTrades = append(closedTrades, storage.TradeRecord{
+			ID:         tradeCounter,
+			StrategyID: pos.strategyID,
+			Symbol:     pos.symbol,
+			Side:       string(strategy.ActionBuy),
+			Quantity:   pos.quantity,
+			EntryPrice: pos.entryPrice,
+			ExitPrice:  exitPrice,
+			StopLoss:   pos.stopLoss,
+			Target:     pos.target,
+			EntryTime:  pos.entryDate,
+			ExitTime:   &lastDate,
+			ExitReason: "backtest_end",
+			PnL:        pnl,
+			Status:     "closed",
+		})
+	}
+
+	// Generate report.
+	logger.Printf("[backtest] completed: %d closed trades, %d still open at end",
+		len(closedTrades), len(positions))
+
+	report := analytics.Analyze(closedTrades, cfg.Capital)
+	fmt.Println(analytics.FormatReport(report))
 }
