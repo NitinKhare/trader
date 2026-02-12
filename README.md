@@ -2,7 +2,7 @@
 
 AI-first automated swing trading system for the Indian equity cash market (NSE, delivery only).
 
-Rule-based strategies enhanced by AI scoring. Four independent strategies target different market conditions. Hard risk guardrails that cannot be overridden. Full backtesting, analytics, and live/paper execution in a single binary.
+Rule-based strategies enhanced by AI scoring. Four independent strategies target different market conditions. Hard risk guardrails that cannot be overridden. Circuit breaker, trailing stop-loss, config hot-reload, and real-time postback processing. Full backtesting, analytics, and live/paper execution in a single binary.
 
 **Philosophy: AI advises, rules decide. Safety over profit.**
 
@@ -24,6 +24,11 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 - [Project Structure](#project-structure)
 - [Running Tests](#running-tests)
 - [CLI Reference](#cli-reference)
+- [Circuit Breaker](#circuit-breaker)
+- [Trailing Stop-Loss](#trailing-stop-loss)
+- [Postback-Driven Position Updates](#postback-driven-position-updates)
+- [Config Hot-Reload](#config-hot-reload)
+- [Graceful Shutdown](#graceful-shutdown)
 - [Dhan API Notes](#dhan-api-notes)
 
 ---
@@ -36,10 +41,12 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 - **Paper and live broker** support via a broker-agnostic interface
 - **Dhan API v2 integration** for orders, holdings, funds, and historical data
 - **Automated stop-loss orders** placed immediately after entry fill confirmation
+- **Trailing stop-loss** adjusts SL upward as price moves in your favor to lock in profits
 - **Order status polling** with configurable interval and timeout
 - **Continuous market-hour polling** for trade execution and exit monitoring
 - **Position persistence and reconciliation** across engine restarts
 - **Dynamic capital tracking** from live broker balance
+- **Postback-driven position updates** via Dhan webhook for real-time trade lifecycle management
 
 ### Risk Management
 - **9 hard risk rules** that cannot be overridden by strategy or AI
@@ -47,24 +54,28 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 - **Sector concentration limits** to prevent overexposure to a single sector
 - **Max holding period** to force-exit stale positions
 - **Daily loss circuit breaker** halts trading when loss threshold is breached
+- **Circuit breaker** automatically halts trading on repeated order failures or API errors
 
 ### Analytics and Backtesting
 - **Full performance analytics** with win rate, Sharpe ratio, max drawdown, profit factor
 - **Per-strategy breakdown** to compare strategy performance side by side
 - **Equity curve generation** for visual analysis
 - **Backtest mode** runs strategies against historical AI outputs day by day
-- **Backtest simulates** SL/target hits, max hold period, and sector limits
+- **Backtest simulates** SL/target hits, max hold period, trailing SL, and sector limits
 
 ### Infrastructure
 - **PostgreSQL/TimescaleDB** for trade, signal, candle, and log storage
 - **Webhook server** for real-time Dhan order postback notifications
+- **Postback-driven updates** process order fills, rejections, and cancellations in real-time
 - **Job scheduler** with nightly, market-hour, and weekly job types
-- **Signal handling** (SIGINT/SIGTERM) for graceful shutdown
+- **Graceful shutdown** waits for in-flight jobs to complete (30s timeout) before exiting
+- **Config hot-reload** changes risk parameters without restarting the engine
 - **Graceful degradation** -- engine works without DB, logs warnings
 
 ### Safety
 - **Live mode double confirmation** requires both CLI flag and environment variable
 - **Live mode config validation** enforces stricter limits on positions, risk, and capital deployment
+- **Circuit breaker** with consecutive failure tracking, hourly sliding window, and cooldown auto-reset
 - **Every trade decision is logged** with full explainability (scores, reason, regime)
 
 ---
@@ -186,7 +197,17 @@ Edit `config/config.json`:
     "max_daily_loss_pct": 3.0,
     "max_capital_deployment_pct": 80.0,
     "max_per_sector": 2,
-    "max_hold_days": 15
+    "max_hold_days": 15,
+    "trailing_stop": {
+      "enabled": true,
+      "trail_pct": 1.5,
+      "activation_pct": 2.0
+    },
+    "circuit_breaker": {
+      "max_consecutive_failures": 3,
+      "max_failures_per_hour": 10,
+      "cooldown_minutes": 30
+    }
   },
   "broker_config": {
     "dhan": {
@@ -276,10 +297,30 @@ go run ./cmd/engine --mode backtest
 |-------|------|---------|-------------|
 | `max_risk_per_trade_pct` | float | 1.0 | Maximum risk per trade as % of capital |
 | `max_open_positions` | int | 5 | Maximum concurrent open positions |
-| `max_daily_loss_pct` | float | 3.0 | Maximum daily loss as % of capital (circuit breaker) |
+| `max_daily_loss_pct` | float | 3.0 | Maximum daily loss as % of capital (daily loss halt) |
 | `max_capital_deployment_pct` | float | 80.0 | Maximum total capital deployed at once |
 | `max_per_sector` | int | 2 | Maximum positions in the same sector (0 = disabled) |
 | `max_hold_days` | int | 15 | Maximum days to hold a position (0 = disabled) |
+
+### Trailing Stop Configuration
+
+Nested under `risk.trailing_stop`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | false | Enable trailing stop-loss adjustment |
+| `trail_pct` | float | 1.5 | Trail distance as % below the high watermark |
+| `activation_pct` | float | 2.0 | Minimum profit % before trailing activates (0 = immediate) |
+
+### Circuit Breaker Configuration
+
+Nested under `risk.circuit_breaker`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_consecutive_failures` | int | 3 | Consecutive order failures before trip (0 = disabled) |
+| `max_failures_per_hour` | int | 10 | Failures within a sliding 1-hour window before trip (0 = disabled) |
+| `cooldown_minutes` | int | 30 | Minutes before auto-reset after trip (0 = manual reset only) |
 
 ### Sector Mapping
 
@@ -320,8 +361,14 @@ Runs after market close (6-8 PM IST). Three sequential jobs:
 
 Runs during market hours (9:15 AM - 3:30 PM IST). Two jobs run repeatedly at the configured polling interval:
 
-1. **execute_trades** -- Reads AI scores and regime, runs all 4 strategies on ranked stocks, validates through risk manager, places approved orders, polls for fills, places automated stop-loss orders
-2. **monitor_exits** -- Checks open positions for max hold period violations, runs strategy exit evaluation, places exit orders, cancels existing SL orders before exits
+1. **execute_trades** -- Reads AI scores and regime, checks circuit breaker status, runs all 4 strategies on ranked stocks, validates through risk manager, places approved orders, polls for fills, places automated stop-loss orders. Broker failures are tracked by the circuit breaker.
+2. **monitor_exits** -- Checks open positions for max hold period violations, adjusts trailing stop-loss levels, runs strategy exit evaluation, places exit orders, cancels existing SL orders before exits.
+
+Additional market-mode behaviors:
+- **Circuit breaker** -- execute_trades is skipped entirely if the circuit breaker is tripped
+- **Postback handler** -- If webhooks are enabled, order fill/reject/cancel events are processed in real-time
+- **Config hot-reload** -- Risk parameters are watched for changes and applied without restart
+- **Graceful shutdown** -- On SIGINT/SIGTERM, waits for in-flight jobs (up to 30s) before exiting
 
 Supports continuous polling (`polling_interval_minutes > 0`) or single execution (`polling_interval_minutes = 0`).
 
@@ -445,7 +492,9 @@ Positions held longer than `max_hold_days` are force-exited during the `monitor_
 
 ### Automated Stop-Loss Orders
 
-After a BUY order is confirmed filled (via order status polling), the engine immediately places a SL-M (stop-loss market) sell order at the strategy's stop-loss price. The SL order ID is persisted in the database alongside the trade record. Before placing a strategy exit, the engine cancels the existing SL order to prevent a double sell.
+After a BUY order is confirmed filled (via order status polling or webhook postback), the engine immediately places a SL-M (stop-loss market) sell order at the strategy's stop-loss price. The SL order ID is persisted in the database alongside the trade record. Before placing a strategy exit, the engine cancels the existing SL order to prevent a double sell.
+
+When a webhook postback reports an SL order as TRADED, the engine automatically marks the position as closed in the database with `sl_hit` as the exit reason.
 
 ### Dynamic Capital Updates
 
@@ -503,6 +552,7 @@ The backtest mode runs the full strategy + risk pipeline against historical data
    - Runs all 4 strategies on each scored stock
    - Validates BUY intents through the risk manager (including sector limits)
    - Simulates fills at the day's close price
+   - Adjusts trailing stop-loss using the candle's high (if enabled)
    - Checks if any open position's SL or target was hit using that day's candle (Low/High)
    - Checks max hold period and force-exits stale positions
 4. At the end, closes any remaining open positions at the last known price
@@ -515,7 +565,200 @@ The backtest mode runs the full strategy + risk pipeline against historical data
 go run ./cmd/engine --mode backtest
 ```
 
-The backtest uses the same config file as live trading, so risk parameters, sector limits, and max hold days are applied consistently.
+The backtest uses the same config file as live trading, so risk parameters, sector limits, trailing stop-loss, and max hold days are applied consistently.
+
+---
+
+## Circuit Breaker
+
+The circuit breaker (`internal/risk/circuit_breaker.go`) automatically halts trading when repeated failures are detected, preventing cascading losses from API outages or broker issues.
+
+### How It Works
+
+The circuit breaker monitors two failure signals:
+
+1. **Consecutive failures** -- Tracks back-to-back order/API failures. Resets to zero on any success.
+2. **Hourly failures** -- Sliding 1-hour window of all failures. Automatically prunes entries older than 1 hour.
+
+When either threshold is breached, the circuit breaker **trips** and blocks all new trade execution. The `execute_trades` job checks `IsTripped()` at the very start and skips the entire run if tripped.
+
+### Failure Sources
+
+The following broker operations are wrapped with circuit breaker tracking:
+
+| Operation | On Failure | On Success |
+|-----------|-----------|------------|
+| `GetFunds()` | `RecordFailure("funds_fetch_failed")` | `RecordSuccess()` |
+| `GetHoldings()` | `RecordFailure("holdings_fetch_failed")` | `RecordSuccess()` |
+| `PlaceOrder()` | `RecordFailure("order_place_failed")` | `RecordSuccess()` |
+| Webhook REJECTED | `RecordFailure("order_rejected: ...")` | -- |
+
+### Recovery
+
+- **Auto-reset** -- If `cooldown_minutes > 0`, the circuit breaker automatically resets after the cooldown period. Each call to `IsTripped()` checks the cooldown.
+- **Manual reset** -- Call `Reset()` programmatically, or restart the engine.
+- **No auto-reset** -- If `cooldown_minutes = 0`, the circuit breaker stays tripped until manual reset or restart.
+
+### Configuration
+
+```json
+"circuit_breaker": {
+  "max_consecutive_failures": 3,
+  "max_failures_per_hour": 10,
+  "cooldown_minutes": 30
+}
+```
+
+Set both thresholds to `0` to disable the circuit breaker entirely.
+
+---
+
+## Trailing Stop-Loss
+
+The trailing stop-loss feature adjusts the stop-loss price upward as a position moves into profit, locking in gains while allowing room for normal price fluctuations.
+
+### How It Works
+
+1. **Activation** -- The trailing SL only activates once the position's unrealized profit reaches `activation_pct`. For example, if `activation_pct = 2.0`, the stock must be 2% above the entry price before trailing begins. Set to `0` for immediate activation.
+
+2. **Trail calculation** -- Once active, the new SL is computed as:
+   ```
+   new_sl = current_high × (1 - trail_pct / 100)
+   ```
+   For example, with `trail_pct = 1.5` and a current high of ₹1000, the trailing SL is ₹985.
+
+3. **Ratchet mechanism** -- The trailing SL only moves **up**, never down. If the computed new SL is below the current SL, it is ignored.
+
+4. **Order replacement** -- Since the Dhan API does not support order modification, the engine cancels the existing SL-M order and places a new SL-M order at the higher price. Both the new SL price and the new SL order ID are persisted in the database.
+
+### Where It Runs
+
+- **Live/paper mode** -- Checked during `monitor_exits` on every polling cycle, after the max hold period check and before strategy exit evaluation.
+- **Backtest mode** -- Applied using the candle's high price for each simulated day. The trailing SL is adjusted before SL/target hit checks, so tightened stops can trigger exits.
+
+### Configuration
+
+```json
+"trailing_stop": {
+  "enabled": true,
+  "trail_pct": 1.5,
+  "activation_pct": 2.0
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Master switch for trailing stop-loss |
+| `trail_pct` | Distance below the high watermark as a percentage (e.g., 1.5 = 1.5%) |
+| `activation_pct` | Minimum profit % before trailing begins (0 = start immediately) |
+
+---
+
+## Postback-Driven Position Updates
+
+When webhooks are enabled, the engine registers a postback handler that processes Dhan order notifications in real-time, replacing polling-based status checks for certain events.
+
+### Events Handled
+
+| Postback Status | Action |
+|----------------|--------|
+| **TRADED / COMPLETED** (entry order) | Auto-place SL-M order, update trade record with fill price |
+| **TRADED / COMPLETED** (SL order) | Mark position as closed with `sl_hit` exit reason, remove from active tracking |
+| **REJECTED** | Record failure in circuit breaker, log rejection reason |
+| **CANCELLED** | Log cancellation, clean up tracking state |
+
+### Order Matching
+
+The postback handler identifies orders by matching the incoming order ID against:
+1. `TradeRecord.OrderID` -- Entry buy orders
+2. `TradeRecord.SLOrderID` -- Stop-loss sell orders
+
+This matching uses thread-safe `GetByOrderID()` and `GetBySLOrderID()` methods on the trade context.
+
+### Thread Safety
+
+The trade context (`tradeContext`) is protected by a `sync.RWMutex` to allow concurrent access from:
+- **Webhook HTTP handler** (goroutine per request) -- processes postbacks
+- **Market-hour jobs** (scheduler goroutines) -- execute trades and monitor exits
+
+All direct map accesses are replaced with thread-safe methods: `Get()`, `Set()`, `Delete()`, `GetByOrderID()`, `GetBySLOrderID()`, `Snapshot()`, `Len()`.
+
+### Configuration
+
+Enable webhooks in `config.json` and register the postback URL in your Dhan dashboard:
+
+```json
+"webhook": {
+  "enabled": true,
+  "port": 8080,
+  "path": "/webhook/dhan/order"
+}
+```
+
+Dhan will POST order status updates to `http://your-server:8080/webhook/dhan/order`.
+
+---
+
+## Config Hot-Reload
+
+The config watcher monitors the configuration file for changes and applies updated risk parameters without restarting the engine.
+
+### How It Works
+
+1. **File polling** -- The watcher checks the config file's modification time every 5 seconds using `os.Stat()` (no external dependencies like `fsnotify`).
+2. **Validation** -- Changed configs are fully parsed and validated. Invalid JSON or configs that fail validation are silently ignored (with a log warning).
+3. **Risk-only changes** -- Only changes to `risk.*` fields trigger a reload. Changes to broker config, database URL, trading mode, or paths require a restart.
+4. **Callback** -- On a valid risk change, the watcher notifies registered callbacks with both the old and new config, enabling the risk manager and circuit breaker to update their parameters atomically.
+
+### What Gets Reloaded
+
+| Field | Hot-Reloadable | Requires Restart |
+|-------|:-:|:-:|
+| `risk.max_risk_per_trade_pct` | Yes | -- |
+| `risk.max_open_positions` | Yes | -- |
+| `risk.max_daily_loss_pct` | Yes | -- |
+| `risk.max_capital_deployment_pct` | Yes | -- |
+| `risk.max_per_sector` | Yes | -- |
+| `risk.max_hold_days` | Yes | -- |
+| `risk.trailing_stop.*` | Yes | -- |
+| `risk.circuit_breaker.*` | Yes | -- |
+| `active_broker` | -- | Yes |
+| `trading_mode` | -- | Yes |
+| `database_url` | -- | Yes |
+| `broker_config.*` | -- | Yes |
+| `webhook.*` | -- | Yes |
+
+### Usage
+
+Simply edit `config.json` while the engine is running in market mode. Changes are picked up within 5 seconds. The engine logs which risk fields changed:
+
+```
+CONFIG RELOAD: risk config changed, applying updates
+CONFIG RELOAD: max_open_positions: 5 → 8
+CONFIG RELOAD: trailing_stop.trail_pct: 1.5 → 2.0
+```
+
+---
+
+## Graceful Shutdown
+
+The engine handles SIGINT (Ctrl+C) and SIGTERM signals to cleanly stop all operations and persist state before exiting.
+
+### Shutdown Sequence
+
+1. **Signal received** -- The signal handler sets the shutdown flag, stopping the scheduler loop.
+2. **Wait for in-flight jobs** -- A `sync.WaitGroup` tracks active `execute_trades` and `monitor_exits` jobs. The engine waits up to **30 seconds** for them to complete.
+3. **Webhook server shutdown** -- If the webhook server is running, it is gracefully shut down (finishes in-flight HTTP requests).
+4. **Config watcher stop** -- The file watcher is stopped.
+5. **Exit** -- The engine exits cleanly with all state persisted.
+
+If in-flight jobs do not complete within 30 seconds, the engine logs a warning and exits anyway to avoid hanging indefinitely.
+
+### What Gets Persisted
+
+- All open trades remain in the database with their current state
+- SL orders remain active at the broker (they are broker-managed, not engine-managed)
+- On next startup, position reconciliation restores the full state
 
 ---
 
@@ -533,16 +776,24 @@ Next morning (during market hours, 9:15 AM - 3:30 PM IST):
   3. Run: ./scripts/run_market.sh
      - Executes pre-planned trades from all 4 strategies
      - Monitors open positions for exits (strategy + max hold period)
+     - Adjusts trailing stop-loss as positions move into profit
      - Places automated stop-loss orders after fills
+     - Processes postback notifications in real-time (if webhook enabled)
+     - Circuit breaker halts trading on repeated failures
      - Continuously polls at configured interval
 
+  4. (Optional) Adjust risk on the fly:
+     - Edit config.json while the engine is running
+     - Changes to risk parameters are picked up within 5 seconds
+     - No restart needed
+
 After market close:
-  4. View analytics: go run ./cmd/engine --mode analytics
+  5. View analytics: go run ./cmd/engine --mode analytics
      - Win rate, Sharpe ratio, drawdown, strategy breakdown
 
 Anytime:
-  5. Check status: go run ./cmd/engine --mode status
-  6. Run backtest: go run ./cmd/engine --mode backtest
+  6. Check status: go run ./cmd/engine --mode status
+  7. Run backtest: go run ./cmd/engine --mode backtest
 ```
 
 ---
@@ -570,6 +821,8 @@ algoTradingAgent/
 |   |-- config/
 |   |   |-- config.go              Config loading, validation, live mode safety checks
 |   |   |-- config_test.go         Config validation tests
+|   |   |-- watcher.go             Config hot-reload (stat-based file polling, risk-only changes)
+|   |   |-- watcher_test.go        Config watcher tests
 |   |
 |   |-- market/
 |   |   |-- calendar.go            IST market hours, holidays, trading day checks
@@ -581,6 +834,8 @@ algoTradingAgent/
 |   |-- risk/
 |   |   |-- risk.go                Risk manager (9 rules including sector concentration)
 |   |   |-- risk_test.go           19 tests (all rules, sector limits, capital updates)
+|   |   |-- circuit_breaker.go     Circuit breaker (consecutive + hourly failure tracking)
+|   |   |-- circuit_breaker_test.go 10 tests (trip, reset, cooldown, config update)
 |   |
 |   |-- scheduler/
 |   |   |-- scheduler.go           Job scheduler (nightly, market-hour, weekly)
@@ -649,10 +904,10 @@ go test -v ./...
 
 # Individual packages
 go test -v ./internal/strategy/     # 4 strategies + indicators (42+ tests)
-go test -v ./internal/risk/         # Risk manager (19 tests)
+go test -v ./internal/risk/         # Risk manager (19 tests) + circuit breaker (10 tests)
 go test -v ./internal/analytics/    # Analytics (12 tests)
 go test -v ./internal/broker/       # Broker tests (paper + Dhan mocked)
-go test -v ./internal/config/       # Config validation
+go test -v ./internal/config/       # Config validation + config watcher (6 tests)
 go test -v ./cmd/engine/            # E2E paper mode tests
 
 # E2E test: full pipeline (scores -> strategy -> risk -> orders)
