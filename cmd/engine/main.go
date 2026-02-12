@@ -1,13 +1,13 @@
 // Package main is the entry point for the algoTradingAgent engine.
 //
 // The engine:
-//   1. Loads configuration
-//   2. Initializes all components (broker, storage, calendar, strategies, risk)
-//   3. Reads AI outputs (scores, regime) from file-based contract
-//   4. Runs the strategy engine against the stock universe
-//   5. Validates trade intents through risk management
-//   6. Executes approved orders via the active broker
-//   7. Logs every action for auditability
+//  1. Loads configuration
+//  2. Initializes all components (broker, storage, calendar, strategies, risk)
+//  3. Reads AI outputs (scores, regime) from file-based contract
+//  4. Runs the strategy engine against the stock universe
+//  5. Validates trade intents through risk management
+//  6. Executes approved orders via the active broker
+//  7. Logs every action for auditability
 //
 // Modes:
 //   - "nightly": Run nightly jobs (data sync, AI scoring, watchlist generation)
@@ -16,15 +16,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -42,7 +46,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config/config.json", "path to configuration file")
-	mode := flag.String("mode", "status", "run mode: nightly | market | status")
+	mode := flag.String("mode", "status", "run mode: nightly | market | status | analytics | backtest | dry-run")
 	confirmLive := flag.Bool("confirm-live", false, "required safety flag to run in live trading mode")
 	flag.Parse()
 
@@ -141,7 +145,7 @@ func main() {
 	logger.Printf("loaded %d strategies", len(strategies))
 
 	// Load sector map from stock universe for sector concentration checks.
-	sectorMap := loadSectorMap(logger)
+	sectorMap := loadSectorMap(logger, cfg.Paths.StockUniverseFile)
 
 	// Initialize scheduler.
 	sched := scheduler.New(cal, logger)
@@ -226,8 +230,13 @@ func main() {
 	case "backtest":
 		runBacktest(cfg, strategies, riskMgr, sectorMap, logger)
 
+	case "dry-run":
+		if err := runDryRun(cfg, strategies, riskMgr, sectorMap, logger); err != nil {
+			logger.Fatalf("dry-run failed: %v", err)
+		}
+
 	default:
-		logger.Fatalf("unknown mode: %s (expected: nightly, market, status, analytics, backtest)", *mode)
+		logger.Fatalf("unknown mode: %s (expected: nightly, market, status, analytics, backtest, dry-run)", *mode)
 	}
 }
 
@@ -284,7 +293,7 @@ func registerNightlyJobs(sched *scheduler.Scheduler, cfg *config.Config, logger 
 			}
 
 			// Load stock universe.
-			universeData, err := os.ReadFile("config/stock_universe.json")
+			universeData, err := os.ReadFile(cfg.Paths.StockUniverseFile)
 			if err != nil {
 				return fmt.Errorf("read stock universe: %w", err)
 			}
@@ -331,25 +340,33 @@ func registerNightlyJobs(sched *scheduler.Scheduler, cfg *config.Config, logger 
 		},
 	})
 
-	// Job 1: Trigger AI scoring pipeline.
+	// Job 1: Trigger AI scoring pipeline via Python.
 	sched.RegisterJob(scheduler.Job{
 		Name: "run_ai_scoring",
 		Type: scheduler.JobTypeNightly,
 		RunFunc: func(ctx context.Context) error {
 			logger.Println("triggering AI scoring pipeline...")
-			// This would shell out to: python -m python_ai.run_scoring --date <today> --output-dir <path>
-			// For now, we just check if outputs exist.
 			today := time.Now().In(market.IST).Format("2006-01-02")
-			regimePath := filepath.Join(cfg.Paths.AIOutputDir, today, "market_regime.json")
-			scoresPath := filepath.Join(cfg.Paths.AIOutputDir, today, "stock_scores.parquet")
 
-			if _, err := os.Stat(regimePath); os.IsNotExist(err) {
-				logger.Printf("AI outputs not found at %s — run python scoring pipeline first", regimePath)
-				return fmt.Errorf("AI scoring outputs not found for %s", today)
+			// Execute the Python scoring pipeline.
+			if err := runPythonScoring(ctx, cfg, today, logger); err != nil {
+				return fmt.Errorf("AI scoring pipeline failed: %w", err)
 			}
-			if _, err := os.Stat(scoresPath); os.IsNotExist(err) {
-				logger.Printf("AI outputs not found at %s — run python scoring pipeline first", scoresPath)
-				return fmt.Errorf("AI scoring outputs not found for %s", today)
+
+			// Validate that outputs were produced.
+			regimePath := filepath.Join(cfg.Paths.AIOutputDir, today, "market_regime.json")
+			if _, err := os.Stat(regimePath); os.IsNotExist(err) {
+				return fmt.Errorf("AI scoring completed but regime file not found at %s", regimePath)
+			}
+
+			// Check for scores in either JSON or Parquet format.
+			scoresJSON := filepath.Join(cfg.Paths.AIOutputDir, today, "stock_scores.json")
+			scoresParquet := filepath.Join(cfg.Paths.AIOutputDir, today, "stock_scores.parquet")
+			_, jsonErr := os.Stat(scoresJSON)
+			_, parquetErr := os.Stat(scoresParquet)
+			if os.IsNotExist(jsonErr) && os.IsNotExist(parquetErr) {
+				return fmt.Errorf("AI scoring completed but scores file not found at %s or %s",
+					scoresJSON, scoresParquet)
 			}
 
 			logger.Printf("AI outputs verified for %s", today)
@@ -1454,8 +1471,8 @@ func runContinuousMarketLoop(
 
 // loadSectorMap reads sector information from stock_universe.json.
 // Returns nil (not an error) if the file doesn't exist or lacks sector data.
-func loadSectorMap(logger *log.Logger) map[string]string {
-	data, err := os.ReadFile("config/stock_universe.json")
+func loadSectorMap(logger *log.Logger, universePath string) map[string]string {
+	data, err := os.ReadFile(universePath)
 	if err != nil {
 		logger.Printf("[sectors] WARNING: cannot load stock_universe.json: %v — sector limits disabled", err)
 		return nil
@@ -1485,6 +1502,304 @@ func loadSectorMap(logger *log.Logger) map[string]string {
 
 	logger.Printf("[sectors] loaded sector map: %d stocks", len(sectorMap))
 	return sectorMap
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Python AI pipeline execution
+// ────────────────────────────────────────────────────────────────────
+
+// runPythonScoring shells out to the Python AI scoring pipeline.
+// It executes: python3 -m python_ai.run_scoring --date <today> --output-dir <path> ...
+// Captures stdout/stderr and logs them. Returns an error if the script fails.
+func runPythonScoring(ctx context.Context, cfg *config.Config, today string, logger *log.Logger) error {
+	pythonPath := cfg.Paths.PythonPath
+	args := []string{
+		"-m", "python_ai.run_scoring",
+		"--date", today,
+		"--output-dir", cfg.Paths.AIOutputDir,
+		"--data-dir", cfg.Paths.MarketDataDir,
+		"--universe-file", cfg.Paths.StockUniverseFile,
+	}
+
+	logger.Printf("[ai-scoring] executing: %s %s", pythonPath, strings.Join(args, " "))
+
+	cmd := exec.CommandContext(ctx, pythonPath, args...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	startTime := time.Now()
+	err := cmd.Run()
+	elapsed := time.Since(startTime)
+
+	// Log stdout line by line.
+	if stdout.Len() > 0 {
+		for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+			logger.Printf("[ai-scoring:stdout] %s", line)
+		}
+	}
+
+	// Log stderr line by line.
+	if stderr.Len() > 0 {
+		for _, line := range strings.Split(strings.TrimSpace(stderr.String()), "\n") {
+			logger.Printf("[ai-scoring:stderr] %s", line)
+		}
+	}
+
+	if err != nil {
+		var execErr *exec.Error
+		var exitErr *exec.ExitError
+		switch {
+		case errors.As(err, &execErr):
+			return fmt.Errorf("python not found at %q: %w (install Python 3.10+ or set paths.python_path in config)",
+				pythonPath, execErr)
+		case errors.As(err, &exitErr):
+			return fmt.Errorf("python scoring failed (exit code %d) after %v: %s",
+				exitErr.ExitCode(), elapsed, strings.TrimSpace(stderr.String()))
+		default:
+			return fmt.Errorf("python not found or not executable at %q: %w", pythonPath, err)
+		}
+	}
+
+	logger.Printf("[ai-scoring] completed successfully in %v", elapsed)
+	return nil
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Dry-run mode
+// ────────────────────────────────────────────────────────────────────
+
+// dryRunEntry captures the result of evaluating a single stock through
+// one strategy + risk validation, without executing any orders.
+type dryRunEntry struct {
+	Symbol     string
+	StrategyID string
+	Action     string  // "BUY", "EXIT", "SKIP", "HOLD"
+	Price      float64
+	StopLoss   float64
+	Target     float64
+	Quantity   int
+	OrderValue float64
+	RiskAmount float64
+	Reason     string
+	RiskResult string // "APPROVED", "REJECTED: <rule>", "N/A"
+}
+
+// runDryRun executes the full strategy + risk pipeline against today's AI outputs
+// and prints a formatted report without placing any orders or writing to the database.
+func runDryRun(
+	cfg *config.Config,
+	strategies []strategy.Strategy,
+	riskMgr *risk.Manager,
+	sectorMap map[string]string,
+	logger *log.Logger,
+) error {
+	logger.Println("═══════════════════════════════════════════════════")
+	logger.Println("              DRY-RUN MODE")
+	logger.Println("═══════════════════════════════════════════════════")
+
+	// Load today's AI regime.
+	today := time.Now().In(market.IST).Format("2006-01-02")
+	regimePath := filepath.Join(cfg.Paths.AIOutputDir, today, "market_regime.json")
+	regimeData, err := os.ReadFile(regimePath)
+	if err != nil {
+		return fmt.Errorf("no AI outputs for today (%s): %w — run nightly mode first", today, err)
+	}
+
+	var regime strategy.MarketRegimeData
+	if err := json.Unmarshal(regimeData, &regime); err != nil {
+		return fmt.Errorf("parse regime: %w", err)
+	}
+
+	// Load stock scores.
+	scoresPath := filepath.Join(cfg.Paths.AIOutputDir, today, "stock_scores.json")
+	scoresData, err := os.ReadFile(scoresPath)
+	if err != nil {
+		return fmt.Errorf("no stock scores for today (%s): %w — run nightly mode first", today, err)
+	}
+
+	var scores []strategy.StockScore
+	if err := json.Unmarshal(scoresData, &scores); err != nil {
+		return fmt.Errorf("parse stock scores: %w", err)
+	}
+	sort.Slice(scores, func(i, j int) bool { return scores[i].Rank < scores[j].Rank })
+
+	logger.Printf("[dry-run] date: %s", today)
+	logger.Printf("[dry-run] regime: %s (confidence: %.2f)", regime.Regime, regime.Confidence)
+	logger.Printf("[dry-run] stocks scored: %d", len(scores))
+	logger.Printf("[dry-run] capital: %.2f", cfg.Capital)
+	logger.Printf("[dry-run] strategies: %d", len(strategies))
+
+	// Simulated state — tracks positions and capital so risk checks
+	// are realistic across multiple stocks in a single dry-run.
+	var openPositions []strategy.PositionInfo
+	availableCapital := cfg.Capital
+	dailyPnL := risk.DailyPnL{Date: time.Now().In(market.IST)}
+
+	var entries []dryRunEntry
+
+	for _, score := range scores {
+		// Load candle history for this symbol.
+		csvPath := filepath.Join(cfg.Paths.MarketDataDir, score.Symbol+".csv")
+		candles := market.LoadExistingCSV(csvPath)
+		if len(candles) == 0 {
+			entries = append(entries, dryRunEntry{
+				Symbol: score.Symbol, Action: "SKIP",
+				Reason: "no candle data", RiskResult: "N/A",
+			})
+			continue
+		}
+
+		// Build strategy input.
+		input := strategy.StrategyInput{
+			Date:              time.Now().In(market.IST),
+			Regime:            regime,
+			Score:             score,
+			Candles:           candles,
+			CurrentPosition:   nil, // dry-run assumes no existing positions
+			OpenPositionCount: len(openPositions),
+			AvailableCapital:  availableCapital,
+		}
+
+		for _, strat := range strategies {
+			intent := strat.Evaluate(input)
+
+			switch intent.Action {
+			case strategy.ActionSkip:
+				entries = append(entries, dryRunEntry{
+					Symbol: score.Symbol, StrategyID: strat.ID(),
+					Action: "SKIP", Reason: intent.Reason, RiskResult: "N/A",
+				})
+
+			case strategy.ActionHold:
+				// No-op for dry-run without existing positions.
+
+			case strategy.ActionBuy:
+				result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital, sectorMap)
+				entry := dryRunEntry{
+					Symbol:     score.Symbol,
+					StrategyID: strat.ID(),
+					Action:     "BUY",
+					Price:      intent.Price,
+					StopLoss:   intent.StopLoss,
+					Target:     intent.Target,
+					Quantity:   intent.Quantity,
+					OrderValue: intent.Price * float64(intent.Quantity),
+					RiskAmount: (intent.Price - intent.StopLoss) * float64(intent.Quantity),
+					Reason:     intent.Reason,
+				}
+				if result.Approved {
+					entry.RiskResult = "APPROVED"
+					// Track simulated state so subsequent risk checks are realistic.
+					availableCapital -= entry.OrderValue
+					openPositions = append(openPositions, strategy.PositionInfo{
+						Symbol:     intent.Symbol,
+						EntryPrice: intent.Price,
+						Quantity:   intent.Quantity,
+						StopLoss:   intent.StopLoss,
+						Target:     intent.Target,
+						StrategyID: intent.StrategyID,
+						SignalID:   intent.SignalID,
+						EntryTime:  time.Now().In(market.IST),
+					})
+				} else {
+					reasons := make([]string, len(result.Rejections))
+					for i, r := range result.Rejections {
+						reasons[i] = r.Rule + ": " + r.Message
+					}
+					entry.RiskResult = "REJECTED: " + strings.Join(reasons, "; ")
+				}
+				entries = append(entries, entry)
+
+			case strategy.ActionExit:
+				entries = append(entries, dryRunEntry{
+					Symbol: score.Symbol, StrategyID: strat.ID(),
+					Action: "EXIT", Price: intent.Price, Quantity: intent.Quantity,
+					Reason: intent.Reason, RiskResult: "N/A",
+				})
+			}
+		}
+	}
+
+	printDryRunReport(regime, entries, cfg.Capital, availableCapital)
+	return nil
+}
+
+// printDryRunReport formats and prints the dry-run results.
+func printDryRunReport(
+	regime strategy.MarketRegimeData,
+	entries []dryRunEntry,
+	totalCapital, remainingCapital float64,
+) {
+	var approvedBuys, rejectedBuys, skips, exits int
+	var totalDeployed float64
+
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════════════════════════════════════════════════════════════════════════")
+	fmt.Println("                                          DRY-RUN REPORT")
+	fmt.Println("═══════════════════════════════════════════════════════════════════════════════════════════════════════════")
+	fmt.Printf("  Regime: %s (confidence: %.2f)\n", regime.Regime, regime.Confidence)
+	fmt.Printf("  Capital: %.2f\n\n", totalCapital)
+
+	// ── APPROVED BUYS ──
+	fmt.Println("── APPROVED BUYS ──────────────────────────────────────────────────────────────────────────────────────────")
+	fmt.Printf("  %-12s %-20s %10s %10s %10s %6s %12s %12s  %s\n",
+		"SYMBOL", "STRATEGY", "PRICE", "SL", "TARGET", "QTY", "ORDER VALUE", "RISK AMT", "REASON")
+	fmt.Printf("  %s\n", strings.Repeat("─", 106))
+
+	for _, e := range entries {
+		if e.Action == "BUY" && strings.HasPrefix(e.RiskResult, "APPROVED") {
+			fmt.Printf("  %-12s %-20s %10.2f %10.2f %10.2f %6d %12.2f %12.2f  %s\n",
+				e.Symbol, e.StrategyID, e.Price, e.StopLoss, e.Target,
+				e.Quantity, e.OrderValue, e.RiskAmount, e.Reason)
+			approvedBuys++
+			totalDeployed += e.OrderValue
+		}
+	}
+	if approvedBuys == 0 {
+		fmt.Println("  (none)")
+	}
+
+	// ── REJECTED BUYS ──
+	fmt.Println()
+	fmt.Println("── REJECTED BUYS ─────────────────────────────────────────────────────────────────────────────────────────")
+	for _, e := range entries {
+		if e.Action == "BUY" && strings.HasPrefix(e.RiskResult, "REJECTED") {
+			fmt.Printf("  %-12s %-20s  price=%.2f qty=%d value=%.2f\n",
+				e.Symbol, e.StrategyID, e.Price, e.Quantity, e.OrderValue)
+			fmt.Printf("    → %s\n", e.RiskResult)
+			rejectedBuys++
+		}
+	}
+	if rejectedBuys == 0 {
+		fmt.Println("  (none)")
+	}
+
+	// Count skips and exits.
+	for _, e := range entries {
+		if e.Action == "SKIP" {
+			skips++
+		}
+		if e.Action == "EXIT" {
+			exits++
+		}
+	}
+
+	// ── SUMMARY ──
+	fmt.Println()
+	fmt.Println("── SUMMARY ───────────────────────────────────────────────────────────────────────────────────────────────")
+	fmt.Printf("  Stocks evaluated:     %d\n", len(entries))
+	fmt.Printf("  Strategy BUY signals: %d\n", approvedBuys+rejectedBuys)
+	fmt.Printf("  Approved buys:        %d\n", approvedBuys)
+	fmt.Printf("  Rejected buys:        %d\n", rejectedBuys)
+	fmt.Printf("  Skips:                %d\n", skips)
+	fmt.Printf("  Exits:                %d\n", exits)
+	if totalCapital > 0 {
+		fmt.Printf("  Capital deployed:     %.2f (%.1f%%)\n", totalDeployed, totalDeployed/totalCapital*100)
+	}
+	fmt.Printf("  Capital remaining:    %.2f\n", remainingCapital)
+	fmt.Println("═══════════════════════════════════════════════════════════════════════════════════════════════════════════")
 }
 
 // ────────────────────────────────────────────────────────────────────

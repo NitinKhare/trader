@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -851,4 +852,176 @@ func TestPaperMode_BuyWithStopLoss(t *testing.T) {
 	if !found {
 		t.Error("expected SLTEST in holdings")
 	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Dry-run mode tests
+// ────────────────────────────────────────────────────────────────────
+
+func TestDryRun_PrintsReport(t *testing.T) {
+	tmpDir := t.TempDir()
+	aiDir := filepath.Join(tmpDir, "ai_outputs")
+	dataDir := filepath.Join(tmpDir, "market_data")
+	today := time.Now().In(market.IST).Format("2006-01-02")
+	todayDir := filepath.Join(aiDir, today)
+
+	// Create regime.
+	regime := strategy.MarketRegimeData{
+		Date:       today,
+		Regime:     strategy.RegimeBull,
+		Confidence: 0.95,
+	}
+	writeJSON(t, filepath.Join(todayDir, "market_regime.json"), regime)
+
+	// Create scores.
+	scores := []strategy.StockScore{
+		{
+			Symbol: "DRYTEST1", TrendStrengthScore: 0.85, BreakoutQualityScore: 0.90,
+			VolatilityScore: 0.50, RiskScore: 0.10, LiquidityScore: 0.80,
+			CompositeScore: 0.85, Rank: 1,
+		},
+		{
+			Symbol: "DRYTEST2", TrendStrengthScore: 0.30, BreakoutQualityScore: 0.20,
+			VolatilityScore: 0.80, RiskScore: 0.70, LiquidityScore: 0.30,
+			CompositeScore: 0.30, Rank: 2,
+		},
+	}
+	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
+
+	// Create candle data.
+	writeTrendingCandles(t, dataDir, "DRYTEST1", 50, 500.0)
+	writeTrendingCandles(t, dataDir, "DRYTEST2", 50, 100.0)
+
+	cfg := &config.Config{
+		ActiveBroker: "dhan",
+		TradingMode:  config.ModePaper,
+		Capital:      500000.0,
+		Risk: config.RiskConfig{
+			MaxRiskPerTradePct:      1.0,
+			MaxOpenPositions:        5,
+			MaxDailyLossPct:         3.0,
+			MaxCapitalDeploymentPct: 80.0,
+		},
+		Paths: config.PathsConfig{
+			AIOutputDir:   aiDir,
+			MarketDataDir: dataDir,
+		},
+		DatabaseURL: "postgres://unused@localhost/unused?sslmode=disable",
+	}
+
+	riskMgr := risk.NewManager(cfg.Risk, cfg.Capital)
+	strategies := []strategy.Strategy{
+		strategy.NewTrendFollowStrategy(cfg.Risk),
+		strategy.NewMeanReversionStrategy(cfg.Risk),
+		strategy.NewBreakoutStrategy(cfg.Risk),
+		strategy.NewMomentumStrategy(cfg.Risk),
+	}
+	logger := log.New(os.Stdout, "[test-dryrun] ", log.LstdFlags)
+
+	err := runDryRun(cfg, strategies, riskMgr, nil, logger)
+	if err != nil {
+		t.Fatalf("runDryRun returned unexpected error: %v", err)
+	}
+}
+
+func TestDryRun_MissingAIOutputs(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := &config.Config{
+		Capital: 500000.0,
+		Paths: config.PathsConfig{
+			AIOutputDir:   filepath.Join(tmpDir, "nonexistent_ai"),
+			MarketDataDir: filepath.Join(tmpDir, "nonexistent_data"),
+		},
+	}
+
+	riskMgr := risk.NewManager(cfg.Risk, cfg.Capital)
+	logger := log.New(os.Stdout, "[test-dryrun] ", log.LstdFlags)
+
+	err := runDryRun(cfg, nil, riskMgr, nil, logger)
+	if err == nil {
+		t.Fatal("expected error when AI outputs are missing")
+	}
+	if !strings.Contains(err.Error(), "no AI outputs") {
+		t.Errorf("expected 'no AI outputs' error, got: %v", err)
+	}
+}
+
+func TestDryRun_MissingScores(t *testing.T) {
+	tmpDir := t.TempDir()
+	aiDir := filepath.Join(tmpDir, "ai_outputs")
+	today := time.Now().In(market.IST).Format("2006-01-02")
+	todayDir := filepath.Join(aiDir, today)
+
+	// Create regime but NOT scores.
+	regime := strategy.MarketRegimeData{
+		Date:       today,
+		Regime:     strategy.RegimeBull,
+		Confidence: 0.95,
+	}
+	writeJSON(t, filepath.Join(todayDir, "market_regime.json"), regime)
+
+	cfg := &config.Config{
+		Capital: 500000.0,
+		Paths: config.PathsConfig{
+			AIOutputDir:   aiDir,
+			MarketDataDir: filepath.Join(tmpDir, "data"),
+		},
+	}
+
+	riskMgr := risk.NewManager(cfg.Risk, cfg.Capital)
+	logger := log.New(os.Stdout, "[test-dryrun] ", log.LstdFlags)
+
+	err := runDryRun(cfg, nil, riskMgr, nil, logger)
+	if err == nil {
+		t.Fatal("expected error when stock scores are missing")
+	}
+	if !strings.Contains(err.Error(), "no stock scores") {
+		t.Errorf("expected 'no stock scores' error, got: %v", err)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Python execution tests
+// ────────────────────────────────────────────────────────────────────
+
+func TestRunPythonScoring_NotFound(t *testing.T) {
+	cfg := &config.Config{
+		Paths: config.PathsConfig{
+			PythonPath:        "/nonexistent/python99",
+			AIOutputDir:       t.TempDir(),
+			MarketDataDir:     t.TempDir(),
+			StockUniverseFile: "/nonexistent/universe.json",
+		},
+	}
+	logger := log.New(os.Stdout, "[test-python] ", log.LstdFlags)
+	ctx := context.Background()
+
+	err := runPythonScoring(ctx, cfg, "2026-02-12", logger)
+	if err == nil {
+		t.Fatal("expected error when Python is not found")
+	}
+	if !strings.Contains(err.Error(), "python not found") {
+		t.Errorf("expected 'python not found' error, got: %v", err)
+	}
+}
+
+func TestRunPythonScoring_ContextCancel(t *testing.T) {
+	cfg := &config.Config{
+		Paths: config.PathsConfig{
+			PythonPath:        "python3",
+			AIOutputDir:       t.TempDir(),
+			MarketDataDir:     t.TempDir(),
+			StockUniverseFile: "./config/stock_universe.json",
+		},
+	}
+	logger := log.New(os.Stdout, "[test-python-cancel] ", log.LstdFlags)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately.
+
+	err := runPythonScoring(ctx, cfg, "2026-02-12", logger)
+	if err == nil {
+		t.Skip("Python not available or executed too fast to cancel")
+	}
+	t.Logf("Cancellation error (expected): %v", err)
 }

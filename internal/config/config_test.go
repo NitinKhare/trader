@@ -240,6 +240,64 @@ func TestLiveMode_ValidConfigPasses(t *testing.T) {
 	}
 }
 
+func TestConfig_PythonPathDefault(t *testing.T) {
+	path := writeTestConfig(t, `{
+		"active_broker": "dhan",
+		"trading_mode": "paper",
+		"capital": 500000,
+		"risk": {
+			"max_risk_per_trade_pct": 1.0,
+			"max_open_positions": 5,
+			"max_daily_loss_pct": 3.0,
+			"max_capital_deployment_pct": 80.0
+		},
+		"paths": {"ai_output_dir": "./ai_outputs"},
+		"database_url": "postgres://localhost/test"
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Paths.PythonPath != "python3" {
+		t.Errorf("expected default python_path 'python3', got %q", cfg.Paths.PythonPath)
+	}
+	if cfg.Paths.StockUniverseFile != "./config/stock_universe.json" {
+		t.Errorf("expected default stock_universe_file './config/stock_universe.json', got %q", cfg.Paths.StockUniverseFile)
+	}
+}
+
+func TestConfig_PythonPathExplicit(t *testing.T) {
+	path := writeTestConfig(t, `{
+		"active_broker": "dhan",
+		"trading_mode": "paper",
+		"capital": 500000,
+		"risk": {
+			"max_risk_per_trade_pct": 1.0,
+			"max_open_positions": 5,
+			"max_daily_loss_pct": 3.0,
+			"max_capital_deployment_pct": 80.0
+		},
+		"paths": {
+			"ai_output_dir": "./ai_outputs",
+			"python_path": "/usr/bin/python3.11",
+			"stock_universe_file": "/custom/universe.json"
+		},
+		"database_url": "postgres://localhost/test"
+	}`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Paths.PythonPath != "/usr/bin/python3.11" {
+		t.Errorf("expected custom python_path, got %q", cfg.Paths.PythonPath)
+	}
+	if cfg.Paths.StockUniverseFile != "/custom/universe.json" {
+		t.Errorf("expected custom stock_universe_file, got %q", cfg.Paths.StockUniverseFile)
+	}
+}
+
 func TestPaperMode_SkipsLiveChecks(t *testing.T) {
 	// Paper mode should NOT enforce live mode restrictions.
 	cfg := Config{

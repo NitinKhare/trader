@@ -137,6 +137,15 @@ type PathsConfig struct {
 
 	// LogDir is where all system logs are written.
 	LogDir string `json:"log_dir"`
+
+	// PythonPath is the path to the Python interpreter used for AI scoring.
+	// Default: "python3"
+	PythonPath string `json:"python_path"`
+
+	// StockUniverseFile is the path to the stock universe JSON file
+	// containing symbol-to-sector mappings.
+	// Default: "./config/stock_universe.json"
+	StockUniverseFile string `json:"stock_universe_file"`
 }
 
 // Load reads configuration from a JSON file.
@@ -166,6 +175,14 @@ func Load(path string) (*Config, error) {
 	}
 	if v := os.Getenv("ALGO_ACTIVE_BROKER"); v != "" {
 		cfg.ActiveBroker = v
+	}
+
+	// Apply defaults for optional path fields.
+	if cfg.Paths.PythonPath == "" {
+		cfg.Paths.PythonPath = "python3"
+	}
+	if cfg.Paths.StockUniverseFile == "" {
+		cfg.Paths.StockUniverseFile = "./config/stock_universe.json"
 	}
 
 	if err := cfg.Validate(); err != nil {
