@@ -116,6 +116,17 @@ func main() {
 		logger.Printf("using LIVE broker: %s", cfg.ActiveBroker)
 	}
 
+	// Fetch and log available funds
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	funds, err := activeBroker.GetFunds(ctx)
+	cancel()
+	if err != nil {
+		logger.Printf("WARNING: could not fetch available funds: %v", err)
+	} else {
+		logger.Printf("[funds] available=₹%.2f used_margin=₹%.2f total_balance=₹%.2f",
+			funds.AvailableCash, funds.UsedMargin, funds.TotalBalance)
+	}
+
 	// Initialize storage (optional — engine works without DB).
 	var store *storage.PostgresStore
 	if cfg.DatabaseURL != "" {
@@ -223,7 +234,7 @@ func main() {
 			}
 		} else {
 			logger.Printf("[market] continuous polling: interval=%v", pollingInterval)
-			runContinuousMarketLoop(ctx, sched, cal, pollingInterval, logger)
+			runContinuousMarketLoop(ctx, sched, cal, pollingInterval, logger, activeBroker)
 		}
 
 		// Graceful shutdown: wait for in-flight jobs to complete.
@@ -1435,6 +1446,7 @@ func runContinuousMarketLoop(
 	cal *market.Calendar,
 	interval time.Duration,
 	logger *log.Logger,
+	b broker.Broker,
 ) {
 	// Run immediately on startup if market is open.
 	if cal.IsMarketOpen(time.Now()) {
@@ -1463,6 +1475,15 @@ func runContinuousMarketLoop(
 			}
 			logger.Printf("[market-loop] running jobs at %s...",
 				now.In(market.IST).Format("15:04:05"))
+
+			// Log available funds before trading
+			timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if funds, err := b.GetFunds(timeoutCtx); err == nil {
+				logger.Printf("[market-loop] [funds] available=₹%.2f used_margin=₹%.2f total=₹%.2f",
+					funds.AvailableCash, funds.UsedMargin, funds.TotalBalance)
+			}
+			cancel()
+
 			if err := sched.RunMarketHourJobs(ctx); err != nil {
 				logger.Printf("[market-loop] jobs failed: %v", err)
 			}
