@@ -154,6 +154,163 @@ func LowestLow(candles []Candle, period int) float64 {
 	return lowest
 }
 
+// CalculateEMA computes the Exponential Moving Average of closing prices over the given period.
+// Uses the standard smoothing factor: 2 / (period + 1).
+// Returns 0 if insufficient data.
+func CalculateEMA(candles []Candle, period int) float64 {
+	if len(candles) < period || period <= 0 {
+		return 0
+	}
+
+	// Seed EMA with SMA of the first `period` candles.
+	var sum float64
+	for i := 0; i < period; i++ {
+		sum += candles[i].Close
+	}
+	ema := sum / float64(period)
+
+	multiplier := 2.0 / float64(period+1)
+	for i := period; i < len(candles); i++ {
+		ema = (candles[i].Close-ema)*multiplier + ema
+	}
+	return ema
+}
+
+// CalculateEMASeries computes EMA values for each candle and returns the full series.
+// Returns nil if insufficient data. Index i corresponds to candles[i].
+func CalculateEMASeries(candles []Candle, period int) []float64 {
+	if len(candles) < period || period <= 0 {
+		return nil
+	}
+
+	result := make([]float64, len(candles))
+	var sum float64
+	for i := 0; i < period; i++ {
+		sum += candles[i].Close
+	}
+	result[period-1] = sum / float64(period)
+
+	multiplier := 2.0 / float64(period+1)
+	for i := period; i < len(candles); i++ {
+		result[i] = (candles[i].Close-result[i-1])*multiplier + result[i-1]
+	}
+	return result
+}
+
+// CalculateVWAP computes the Volume Weighted Average Price over the last `period` candles.
+// VWAP = Sum(TypicalPrice × Volume) / Sum(Volume).
+// TypicalPrice = (High + Low + Close) / 3.
+// Returns 0 if insufficient data or zero volume.
+func CalculateVWAP(candles []Candle, period int) float64 {
+	if len(candles) == 0 || period <= 0 {
+		return 0
+	}
+
+	start := len(candles) - period
+	if start < 0 {
+		start = 0
+	}
+
+	var cumTPV, cumVol float64
+	for i := start; i < len(candles); i++ {
+		tp := (candles[i].High + candles[i].Low + candles[i].Close) / 3.0
+		vol := float64(candles[i].Volume)
+		cumTPV += tp * vol
+		cumVol += vol
+	}
+
+	if cumVol == 0 {
+		return 0
+	}
+	return cumTPV / cumVol
+}
+
+// CalculateMACD computes the MACD line, signal line, and histogram.
+// MACD Line = EMA(fast) - EMA(slow). Signal = EMA(MACD Line, signal period).
+// Standard parameters: fast=12, slow=26, signal=9.
+// Returns macdLine, signalLine, histogram.
+// Returns all zeros if insufficient data.
+func CalculateMACD(candles []Candle, fastPeriod, slowPeriod, signalPeriod int) (float64, float64, float64) {
+	if len(candles) < slowPeriod+signalPeriod {
+		return 0, 0, 0
+	}
+
+	// Compute full EMA series for fast and slow.
+	fastEMA := CalculateEMASeries(candles, fastPeriod)
+	slowEMA := CalculateEMASeries(candles, slowPeriod)
+	if fastEMA == nil || slowEMA == nil {
+		return 0, 0, 0
+	}
+
+	// Build MACD line series starting from slowPeriod-1.
+	macdStart := slowPeriod - 1
+	macdLen := len(candles) - macdStart
+	macdSeries := make([]float64, macdLen)
+	for i := 0; i < macdLen; i++ {
+		macdSeries[i] = fastEMA[macdStart+i] - slowEMA[macdStart+i]
+	}
+
+	// Signal line = EMA of MACD series.
+	if len(macdSeries) < signalPeriod {
+		return macdSeries[len(macdSeries)-1], 0, macdSeries[len(macdSeries)-1]
+	}
+
+	var sum float64
+	for i := 0; i < signalPeriod; i++ {
+		sum += macdSeries[i]
+	}
+	signalEMA := sum / float64(signalPeriod)
+
+	multiplier := 2.0 / float64(signalPeriod+1)
+	for i := signalPeriod; i < len(macdSeries); i++ {
+		signalEMA = (macdSeries[i]-signalEMA)*multiplier + signalEMA
+	}
+
+	macdLine := macdSeries[len(macdSeries)-1]
+	histogram := macdLine - signalEMA
+	return macdLine, signalEMA, histogram
+}
+
+// CalculatePrevMACD returns the MACD line and signal for the candles excluding the last one.
+// Useful for detecting crossovers (comparing current vs previous MACD).
+func CalculatePrevMACD(candles []Candle, fastPeriod, slowPeriod, signalPeriod int) (float64, float64) {
+	if len(candles) < 2 {
+		return 0, 0
+	}
+	macd, signal, _ := CalculateMACD(candles[:len(candles)-1], fastPeriod, slowPeriod, signalPeriod)
+	return macd, signal
+}
+
+// CalculateBollingerBands computes the Bollinger Bands (middle, upper, lower) and bandwidth.
+// Middle = SMA(period). Upper/Lower = Middle ± (stddev × multiplier).
+// Bandwidth = (Upper - Lower) / Middle (as a ratio).
+// Returns middle, upper, lower, bandwidth. All zeros if insufficient data.
+func CalculateBollingerBands(candles []Candle, period int, multiplier float64) (float64, float64, float64, float64) {
+	if len(candles) < period || period <= 0 {
+		return 0, 0, 0, 0
+	}
+
+	middle := CalculateSMA(candles, period)
+	if middle == 0 {
+		return 0, 0, 0, 0
+	}
+
+	// Calculate standard deviation.
+	start := len(candles) - period
+	var sumSqDiff float64
+	for i := start; i < len(candles); i++ {
+		diff := candles[i].Close - middle
+		sumSqDiff += diff * diff
+	}
+	stddev := math.Sqrt(sumSqDiff / float64(period))
+
+	upper := middle + stddev*multiplier
+	lower := middle - stddev*multiplier
+	bandwidth := (upper - lower) / middle
+
+	return middle, upper, lower, bandwidth
+}
+
 // AverageVolume computes the average volume over the last `period` candles.
 // Returns 0 if insufficient data.
 func AverageVolume(candles []Candle, period int) float64 {

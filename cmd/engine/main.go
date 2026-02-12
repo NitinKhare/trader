@@ -141,6 +141,11 @@ func main() {
 		strategy.NewMeanReversionStrategy(cfg.Risk),
 		strategy.NewBreakoutStrategy(cfg.Risk),
 		strategy.NewMomentumStrategy(cfg.Risk),
+		strategy.NewVWAPReversionStrategy(cfg.Risk),
+		strategy.NewPullbackStrategy(cfg.Risk),
+		strategy.NewORBStrategy(cfg.Risk),
+		strategy.NewMACDCrossoverStrategy(cfg.Risk),
+		strategy.NewBollingerSqueezeStrategy(cfg.Risk),
 	}
 	logger.Printf("loaded %d strategies", len(strategies))
 

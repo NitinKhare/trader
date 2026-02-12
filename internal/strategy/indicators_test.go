@@ -209,3 +209,191 @@ func TestAverageVolume_Empty(t *testing.T) {
 		t.Errorf("expected 0 for empty candles, got %.0f", avgVol)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// EMA tests
+// ──────────────────────────────────────────────────────────────────────
+
+func TestCalculateEMA_Basic(t *testing.T) {
+	// Accelerating prices so EMA (weights recent data more) exceeds SMA.
+	candles := makeIndicatorCandles([]float64{10, 12, 15, 20, 28, 40, 55, 75, 100, 130})
+	ema := CalculateEMA(candles, 5)
+	sma := CalculateSMA(candles, 5)
+	if ema <= sma {
+		t.Errorf("expected EMA > SMA for accelerating prices, got EMA=%.2f SMA=%.2f", ema, sma)
+	}
+	if ema <= 0 {
+		t.Errorf("expected positive EMA, got %.2f", ema)
+	}
+}
+
+func TestCalculateEMA_InsufficientData(t *testing.T) {
+	candles := makeIndicatorCandles([]float64{10, 20})
+	ema := CalculateEMA(candles, 5)
+	if ema != 0 {
+		t.Errorf("expected 0 for insufficient data, got %.2f", ema)
+	}
+}
+
+func TestCalculateEMASeries_Length(t *testing.T) {
+	candles := makeIndicatorCandles([]float64{10, 20, 30, 40, 50, 60, 70, 80, 90, 100})
+	series := CalculateEMASeries(candles, 5)
+	if len(series) != len(candles) {
+		t.Errorf("expected series length %d, got %d", len(candles), len(series))
+	}
+	// Last value should match CalculateEMA.
+	ema := CalculateEMA(candles, 5)
+	if !almostEqual(series[len(series)-1], ema, 0.001) {
+		t.Errorf("series last=%.4f != EMA=%.4f", series[len(series)-1], ema)
+	}
+}
+
+func TestCalculateEMASeries_InsufficientData(t *testing.T) {
+	candles := makeIndicatorCandles([]float64{10})
+	series := CalculateEMASeries(candles, 5)
+	if series != nil {
+		t.Errorf("expected nil for insufficient data, got %v", series)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// VWAP tests
+// ──────────────────────────────────────────────────────────────────────
+
+func TestCalculateVWAP_Basic(t *testing.T) {
+	candles := makeIndicatorCandles([]float64{100, 102, 104, 106, 108})
+	vwap := CalculateVWAP(candles, 5)
+	if vwap <= 0 {
+		t.Errorf("expected positive VWAP, got %.2f", vwap)
+	}
+	// VWAP should be near the average price since volumes are similar.
+	sma := CalculateSMA(candles, 5)
+	if !almostEqual(vwap, sma, 5) {
+		t.Errorf("VWAP %.2f too far from SMA %.2f", vwap, sma)
+	}
+}
+
+func TestCalculateVWAP_ZeroVolume(t *testing.T) {
+	candles := []Candle{
+		{Close: 100, High: 102, Low: 98, Volume: 0},
+		{Close: 105, High: 107, Low: 103, Volume: 0},
+	}
+	vwap := CalculateVWAP(candles, 2)
+	if vwap != 0 {
+		t.Errorf("expected VWAP=0 for zero volume, got %.2f", vwap)
+	}
+}
+
+func TestCalculateVWAP_InsufficientData(t *testing.T) {
+	vwap := CalculateVWAP(nil, 5)
+	if vwap != 0 {
+		t.Errorf("expected VWAP=0 for nil candles, got %.2f", vwap)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// MACD tests
+// ──────────────────────────────────────────────────────────────────────
+
+func TestCalculateMACD_Basic(t *testing.T) {
+	// Rising prices → MACD should be positive.
+	prices := make([]float64, 50)
+	for i := range prices {
+		prices[i] = 100 + float64(i)*2
+	}
+	candles := makeIndicatorCandles(prices)
+	macdLine, signalLine, histogram := CalculateMACD(candles, 12, 26, 9)
+
+	if macdLine <= 0 {
+		t.Errorf("expected positive MACD for rising prices, got %.4f", macdLine)
+	}
+	if signalLine <= 0 {
+		t.Errorf("expected positive signal line for rising prices, got %.4f", signalLine)
+	}
+	// For a consistent trend, histogram should be near zero or slightly positive.
+	_ = histogram
+}
+
+func TestCalculateMACD_InsufficientData(t *testing.T) {
+	candles := makeIndicatorCandles([]float64{100, 102, 104})
+	macd, signal, hist := CalculateMACD(candles, 12, 26, 9)
+	if macd != 0 || signal != 0 || hist != 0 {
+		t.Errorf("expected all zeros for insufficient data, got MACD=%.4f signal=%.4f hist=%.4f",
+			macd, signal, hist)
+	}
+}
+
+func TestCalculatePrevMACD_Shift(t *testing.T) {
+	// Use non-linear prices so adding one candle changes MACD values.
+	prices := make([]float64, 50)
+	for i := range prices {
+		prices[i] = 100 + float64(i)*2 + float64(i%5)*3
+	}
+	candles := makeIndicatorCandles(prices)
+
+	prevMACD, prevSignal := CalculatePrevMACD(candles, 12, 26, 9)
+	currMACD, currSignal, _ := CalculateMACD(candles, 12, 26, 9)
+
+	// Previous should differ from current with non-linear data.
+	if prevMACD == currMACD && prevSignal == currSignal {
+		t.Errorf("prev MACD should differ from current: prev(%.6f, %.6f) curr(%.6f, %.6f)",
+			prevMACD, prevSignal, currMACD, currSignal)
+	}
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Bollinger Band tests
+// ──────────────────────────────────────────────────────────────────────
+
+func TestCalculateBollingerBands_Basic(t *testing.T) {
+	prices := make([]float64, 25)
+	for i := range prices {
+		prices[i] = 100 + float64(i%5)*2 - float64(i%3)
+	}
+	candles := makeIndicatorCandles(prices)
+	middle, upper, lower, bandwidth := CalculateBollingerBands(candles, 20, 2.0)
+
+	if middle <= 0 {
+		t.Errorf("expected positive middle band, got %.2f", middle)
+	}
+	if upper <= middle {
+		t.Errorf("expected upper %.2f > middle %.2f", upper, middle)
+	}
+	if lower >= middle {
+		t.Errorf("expected lower %.2f < middle %.2f", lower, middle)
+	}
+	if bandwidth <= 0 {
+		t.Errorf("expected positive bandwidth, got %.4f", bandwidth)
+	}
+}
+
+func TestCalculateBollingerBands_InsufficientData(t *testing.T) {
+	candles := makeIndicatorCandles([]float64{100, 102})
+	mid, upper, lower, bw := CalculateBollingerBands(candles, 20, 2.0)
+	if mid != 0 || upper != 0 || lower != 0 || bw != 0 {
+		t.Errorf("expected all zeros for insufficient data")
+	}
+}
+
+func TestCalculateBollingerBands_ConstantPrice(t *testing.T) {
+	// Constant prices → stddev=0, upper=lower=middle.
+	prices := make([]float64, 25)
+	for i := range prices {
+		prices[i] = 100
+	}
+	candles := makeIndicatorCandles(prices)
+	middle, upper, lower, bandwidth := CalculateBollingerBands(candles, 20, 2.0)
+
+	if middle != 100 {
+		t.Errorf("expected middle=100, got %.2f", middle)
+	}
+	if upper != 100 {
+		t.Errorf("expected upper=100 for zero stddev, got %.2f", upper)
+	}
+	if lower != 100 {
+		t.Errorf("expected lower=100 for zero stddev, got %.2f", lower)
+	}
+	if bandwidth != 0 {
+		t.Errorf("expected bandwidth=0 for zero stddev, got %.4f", bandwidth)
+	}
+}

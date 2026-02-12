@@ -2,7 +2,7 @@
 
 AI-first automated swing trading system for the Indian equity cash market (NSE, delivery only).
 
-Rule-based strategies enhanced by AI scoring. Four independent strategies target different market conditions. Hard risk guardrails that cannot be overridden. Circuit breaker, trailing stop-loss, config hot-reload, and real-time postback processing. Full backtesting, analytics, and live/paper execution in a single binary.
+Rule-based strategies enhanced by AI scoring. Nine independent strategies target different market conditions — trend following, mean reversion, breakout, momentum, VWAP reversion, EMA pullback, range breakout, MACD crossover, and Bollinger squeeze. Hard risk guardrails that cannot be overridden. Circuit breaker, trailing stop-loss, config hot-reload, and real-time postback processing. Dry-run mode for risk-free pipeline validation. Integrated Python AI scoring pipeline. Full backtesting, analytics, and live/paper execution in a single binary.
 
 **Philosophy: AI advises, rules decide. Safety over profit.**
 
@@ -29,6 +29,7 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 - [Postback-Driven Position Updates](#postback-driven-position-updates)
 - [Config Hot-Reload](#config-hot-reload)
 - [Graceful Shutdown](#graceful-shutdown)
+- [Dry-Run Mode](#dry-run-mode)
 - [Dhan API Notes](#dhan-api-notes)
 
 ---
@@ -36,7 +37,7 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 ## Features
 
 ### Trading Engine
-- **4 independent strategies** targeting different market conditions (trend follow, mean reversion, breakout, momentum)
+- **9 independent strategies** targeting different market conditions (trend follow, mean reversion, breakout, momentum, VWAP reversion, EMA pullback, opening range breakout, MACD crossover, Bollinger squeeze)
 - **AI-driven stock scoring** with market regime detection (BULL / SIDEWAYS / BEAR)
 - **Paper and live broker** support via a broker-agnostic interface
 - **Dhan API v2 integration** for orders, holdings, funds, and historical data
@@ -47,6 +48,7 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 - **Position persistence and reconciliation** across engine restarts
 - **Dynamic capital tracking** from live broker balance
 - **Postback-driven position updates** via Dhan webhook for real-time trade lifecycle management
+- **Dry-run mode** validates the full pipeline without placing orders, prints a detailed report
 
 ### Risk Management
 - **9 hard risk rules** that cannot be overridden by strategy or AI
@@ -70,6 +72,7 @@ Rule-based strategies enhanced by AI scoring. Four independent strategies target
 - **Job scheduler** with nightly, market-hour, and weekly job types
 - **Graceful shutdown** waits for in-flight jobs to complete (30s timeout) before exiting
 - **Config hot-reload** changes risk parameters without restarting the engine
+- **Integrated Python AI pipeline** nightly mode executes Python scoring directly
 - **Graceful degradation** -- engine works without DB, logs warnings
 
 ### Safety
@@ -222,7 +225,9 @@ Edit `config/config.json`:
   "paths": {
     "ai_output_dir": "./ai_outputs",
     "market_data_dir": "./market_data",
-    "log_dir": "./logs"
+    "log_dir": "./logs",
+    "python_path": "python3",
+    "stock_universe_file": "./config/stock_universe.json"
   },
   "webhook": {
     "enabled": false,
@@ -285,6 +290,9 @@ go run ./cmd/engine --mode analytics
 
 # Run backtest against historical data
 go run ./cmd/engine --mode backtest
+
+# Preview trades without placing orders
+go run ./cmd/engine --mode dry-run
 ```
 
 ---
@@ -322,6 +330,16 @@ Nested under `risk.circuit_breaker`:
 | `max_failures_per_hour` | int | 10 | Failures within a sliding 1-hour window before trip (0 = disabled) |
 | `cooldown_minutes` | int | 30 | Minutes before auto-reset after trip (0 = manual reset only) |
 
+### Paths Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ai_output_dir` | string | -- | Directory where Python writes scoring outputs (required) |
+| `market_data_dir` | string | -- | Directory for cached OHLCV market data |
+| `log_dir` | string | -- | Directory for system logs |
+| `python_path` | string | `"python3"` | Path to the Python interpreter for AI scoring |
+| `stock_universe_file` | string | `"./config/stock_universe.json"` | Path to the stock universe JSON with sector mappings |
+
 ### Sector Mapping
 
 The stock universe (`config/stock_universe.json`) maps each NIFTY 50 stock to its sector:
@@ -354,7 +372,7 @@ Prints current system state: market hours, trading day status, next session time
 Runs after market close (6-8 PM IST). Three sequential jobs:
 
 1. **sync_market_data** -- Fetches 1 year of OHLCV data from Dhan API for all NIFTY 50 stocks, exports as CSVs
-2. **run_ai_scoring** -- Verifies AI scoring outputs exist for today
+2. **run_ai_scoring** -- Executes the Python AI scoring pipeline (`python3 -m python_ai.run_scoring`), then verifies outputs exist
 3. **generate_watchlist** -- Reads market regime, prepares next-day watchlist
 
 ### `--mode market`
@@ -388,6 +406,10 @@ Runs all strategies against historical AI outputs day by day:
 6. Applies max hold period, closes remaining positions at backtest end
 7. Generates full analytics report
 
+### `--mode dry-run`
+
+Validates the full strategy + risk pipeline against today's AI outputs without placing any orders. Prints a detailed report showing which stocks would be bought, rejected, and why. See [Dry-Run Mode](#dry-run-mode) for full details.
+
 ---
 
 ## Strategies
@@ -403,6 +425,11 @@ All strategies share a common set of indicators (`internal/strategy/indicators.g
 | ATR | `CalculateATR(candles, period)` | Average True Range (volatility measure) |
 | RSI | `CalculateRSI(candles, period)` | Relative Strength Index (momentum oscillator, 0-100) |
 | SMA | `CalculateSMA(candles, period)` | Simple Moving Average |
+| EMA | `CalculateEMA(candles, period)` | Exponential Moving Average (weights recent data more) |
+| EMA Series | `CalculateEMASeries(candles, period)` | Full EMA series for each candle |
+| VWAP | `CalculateVWAP(candles, period)` | Volume Weighted Average Price (fair value anchor) |
+| MACD | `CalculateMACD(candles, fast, slow, signal)` | MACD line, signal line, and histogram |
+| Bollinger Bands | `CalculateBollingerBands(candles, period, mult)` | Middle, upper, lower bands and bandwidth |
 | ROC | `CalculateROC(candles, period)` | Rate of Change (% price momentum) |
 | Highest High | `HighestHigh(candles, period)` | Highest high over N periods |
 | Lowest Low | `LowestLow(candles, period)` | Lowest low over N periods |
@@ -456,13 +483,73 @@ Buys top-ranked stocks with strong momentum in BULL markets.
 | **Exit** | BEAR regime, ROC negative, rank > 10, or trend < 0.5 |
 | **Sizing** | Risk-based |
 
+### 5. VWAP Reversion (`vwap_reversion_v1`)
+
+Buys when price dips significantly below VWAP, expecting reversion to fair value. VWAP is a natural support level where institutional traders accumulate.
+
+| | Criteria |
+|---|---|
+| **Entry** | BULL/SIDEWAYS regime, price >= 2% below VWAP(20), RSI(14) < 40, volatility <= 0.7, liquidity >= 0.5, risk <= 0.5 |
+| **Stop Loss** | Entry - 1.5 x ATR(14) |
+| **Target** | VWAP (fair value) |
+| **Exit** | BEAR regime, price crosses above VWAP, RSI > 65 |
+| **Sizing** | Risk-based |
+
+### 6. EMA Pullback (`pullback_v1`)
+
+Buys dips in an established uptrend. One of the most reliable swing setups — entering at a discount within a strong trend.
+
+| | Criteria |
+|---|---|
+| **Entry** | BULL regime, trend >= 0.5, price > 50-EMA (uptrend), price within 1% of 20-EMA (pullback), RSI 40-60, risk <= 0.5 |
+| **Stop Loss** | Entry - 2.0 x ATR(14) |
+| **Target** | Entry + 2.5 x risk_per_share |
+| **Exit** | BEAR regime, price below 50-EMA (uptrend broken), trend < 0.3 |
+| **Sizing** | Risk-based |
+
+### 7. Opening Range Breakout (`orb_v1`)
+
+Identifies stocks consolidating in a tight range (ATR compression) and buys when they break out with volume. Tight consolidation precedes explosive directional moves.
+
+| | Criteria |
+|---|---|
+| **Entry** | BULL regime, short ATR / long ATR < 0.6 (squeeze), price > consolidation high, volume > 1.3x avg, trend >= 0.4, breakout >= 0.5, risk <= 0.5 |
+| **Stop Loss** | Consolidation low - 1.5 x short ATR |
+| **Target** | Entry + 3.0 x risk_per_share |
+| **Exit** | BEAR regime, price below entry (failed breakout), trend < 0.25 |
+| **Sizing** | Risk-based |
+
+### 8. MACD Crossover (`macd_crossover_v1`)
+
+Buys on MACD bullish crossover (MACD line crosses above signal line), confirming a shift from bearish to bullish momentum. Standard parameters: 12/26/9.
+
+| | Criteria |
+|---|---|
+| **Entry** | BULL regime, MACD > signal (fresh crossover), histogram > 0, trend >= 0.4, risk <= 0.5, liquidity >= 0.4 |
+| **Stop Loss** | Entry - 2.0 x ATR(14) |
+| **Target** | Entry + 2.0 x risk_per_share |
+| **Exit** | BEAR regime, MACD bearish crossover (MACD < signal or histogram < 0), trend < 0.25 |
+| **Sizing** | Risk-based |
+
+### 9. Bollinger Band Squeeze (`bollinger_squeeze_v1`)
+
+Identifies periods of extreme low volatility (narrow Bollinger Bands) that precede explosive moves. Buys when price breaks above the upper band after a squeeze.
+
+| | Criteria |
+|---|---|
+| **Entry** | BULL/SIDEWAYS regime, prior bandwidth < 0.10 (squeeze), price > upper band, volume > 1.2x avg, trend >= 0.3, risk <= 0.5 |
+| **Stop Loss** | Lower Bollinger Band |
+| **Target** | Entry + 2.5 x risk_per_share |
+| **Exit** | BEAR regime, price below middle band (momentum lost), trend < 0.2 |
+| **Sizing** | Risk-based |
+
 ### Strategy Selection by Market Condition
 
-| Regime | Trend Follow | Mean Reversion | Breakout | Momentum |
-|--------|:---:|:---:|:---:|:---:|
-| BULL | Active | Active (oversold only) | Active | Active |
-| SIDEWAYS | -- | Active (oversold only) | -- | -- |
-| BEAR | Exit only | Exit only | Exit only | Exit only |
+| Regime | Trend Follow | Mean Reversion | Breakout | Momentum | VWAP Rev. | Pullback | ORB | MACD | Bollinger |
+|--------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| BULL | Active | Active | Active | Active | Active | Active | Active | Active | Active |
+| SIDEWAYS | -- | Active | -- | -- | Active | -- | -- | -- | Active |
+| BEAR | Exit only | Exit only | Exit only | Exit only | Exit only | Exit only | Exit only | Exit only | Exit only |
 
 ---
 
@@ -772,8 +859,13 @@ Evening (after market close, 6-8 PM IST):
      - Generates next-day watchlist
   2. Review scores in ai_outputs/<date>/
 
-Next morning (during market hours, 9:15 AM - 3:30 PM IST):
-  3. Run: ./scripts/run_market.sh
+Next morning (before or during market hours):
+  3. (Optional) Preview trades: go run ./cmd/engine --mode dry-run
+     - See exactly which stocks would be bought/rejected and why
+     - No orders placed, no state changes
+
+During market hours (9:15 AM - 3:30 PM IST):
+  4. Run: ./scripts/run_market.sh
      - Executes pre-planned trades from all 4 strategies
      - Monitors open positions for exits (strategy + max hold period)
      - Adjusts trailing stop-loss as positions move into profit
@@ -782,18 +874,19 @@ Next morning (during market hours, 9:15 AM - 3:30 PM IST):
      - Circuit breaker halts trading on repeated failures
      - Continuously polls at configured interval
 
-  4. (Optional) Adjust risk on the fly:
+  5. (Optional) Adjust risk on the fly:
      - Edit config.json while the engine is running
      - Changes to risk parameters are picked up within 5 seconds
      - No restart needed
 
 After market close:
-  5. View analytics: go run ./cmd/engine --mode analytics
+  6. View analytics: go run ./cmd/engine --mode analytics
      - Win rate, Sharpe ratio, drawdown, strategy breakdown
 
 Anytime:
-  6. Check status: go run ./cmd/engine --mode status
-  7. Run backtest: go run ./cmd/engine --mode backtest
+  7. Check status: go run ./cmd/engine --mode status
+  8. Run backtest: go run ./cmd/engine --mode backtest
+  9. Dry-run preview: go run ./cmd/engine --mode dry-run
 ```
 
 ---
@@ -847,8 +940,8 @@ algoTradingAgent/
 |   |
 |   |-- strategy/
 |   |   |-- strategy.go            Strategy interface, types (TradeIntent, StockScore, Candle, etc.)
-|   |   |-- indicators.go          Shared indicators (ATR, RSI, SMA, ROC, HighestHigh, etc.)
-|   |   |-- indicators_test.go     18 indicator tests
+|   |   |-- indicators.go          Shared indicators (ATR, RSI, SMA, EMA, VWAP, MACD, Bollinger, etc.)
+|   |   |-- indicators_test.go     33 indicator tests
 |   |   |-- trend_follow.go        Trend Following strategy
 |   |   |-- trend_follow_test.go   Trend follow tests
 |   |   |-- mean_reversion.go      Mean Reversion strategy
@@ -857,6 +950,16 @@ algoTradingAgent/
 |   |   |-- breakout_test.go       8 tests
 |   |   |-- momentum.go            Momentum strategy
 |   |   |-- momentum_test.go       8 tests
+|   |   |-- vwap.go                VWAP Reversion strategy
+|   |   |-- vwap_test.go           5 tests
+|   |   |-- pullback.go            EMA Pullback strategy
+|   |   |-- pullback_test.go       5 tests
+|   |   |-- orb.go                 Opening Range Breakout strategy
+|   |   |-- orb_test.go            5 tests
+|   |   |-- macd.go                MACD Crossover strategy
+|   |   |-- macd_test.go           6 tests
+|   |   |-- bollinger.go           Bollinger Band Squeeze strategy
+|   |   |-- bollinger_test.go      5 tests
 |   |
 |   |-- webhook/
 |       |-- webhook.go             Dhan order postback HTTP server
@@ -924,6 +1027,11 @@ go test -v ./cmd/engine/ -run TestPaperMode
 | `TestPaperMode_DynamicCapital` | Capital updates from broker balance affect risk limits |
 | `TestPaperMode_SLOrderPlacement` | Stop-loss orders placed after entry fill confirmation |
 | `TestPaperMode_ContinuousPolling` | Continuous market-hour polling works correctly |
+| `TestDryRun_PrintsReport` | Dry-run loads AI data, runs strategies + risk, prints report without placing orders |
+| `TestDryRun_MissingAIOutputs` | Dry-run returns error when no AI outputs exist |
+| `TestDryRun_MissingScores` | Dry-run returns error when scores file is missing |
+| `TestRunPythonScoring_NotFound` | Python execution returns clear error when interpreter not found |
+| `TestRunPythonScoring_ContextCancel` | Python execution respects context cancellation |
 
 Tests use `ForceRunMarketHourJobs()` to bypass the IST market-hours check, so they pass at any time of day.
 
@@ -952,6 +1060,9 @@ go run ./cmd/engine --mode analytics
 # Run backtest against historical data
 go run ./cmd/engine --mode backtest
 
+# Dry-run: preview trades without placing orders
+go run ./cmd/engine --mode dry-run
+
 # Custom config path
 go run ./cmd/engine --config /path/to/config.json --mode market
 ```
@@ -961,7 +1072,7 @@ go run ./cmd/engine --config /path/to/config.json --mode market
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | `config/config.json` | Path to configuration file |
-| `--mode` | `status` | Run mode: `nightly`, `market`, `status`, `analytics`, `backtest` |
+| `--mode` | `status` | Run mode: `nightly`, `market`, `status`, `analytics`, `backtest`, `dry-run` |
 | `--confirm-live` | `false` | Required safety flag to enable live trading |
 
 ### Environment Variables
@@ -974,6 +1085,67 @@ go run ./cmd/engine --config /path/to/config.json --mode market
 | `ALGO_LIVE_CONFIRMED` | Must be `true` (with `--confirm-live`) to start live mode |
 | `DHAN_CLIENT_ID` | Override Dhan client ID |
 | `DHAN_ACCESS_TOKEN` | Override Dhan access token |
+
+---
+
+## Dry-Run Mode
+
+The dry-run mode (`--mode dry-run`) validates the full trading pipeline without placing any orders. It loads today's AI outputs, runs all 4 strategies, validates through the risk manager, and prints a detailed report.
+
+### What It Does
+
+1. Loads today's market regime and stock scores from `ai_outputs/{today}/`
+2. Loads candle data from market data CSVs
+3. Runs all 4 strategies (trend follow, mean reversion, breakout, momentum) on each scored stock
+4. Validates BUY intents through the risk manager (including sector limits, capital deployment, daily loss)
+5. Tracks simulated positions and capital so risk checks are realistic across stocks
+6. Prints a formatted report and exits
+
+### What It Does NOT Do
+
+- No broker is initialized (no orders placed, not even paper orders)
+- No database writes (no trade records, no logs)
+- No state changes (no position tracking, no capital changes)
+- No webhook server started
+
+### Usage
+
+```bash
+# Run after nightly mode has produced AI outputs
+go run ./cmd/engine --mode dry-run
+
+# With custom config
+go run ./cmd/engine --config /path/to/config.json --mode dry-run
+```
+
+### Sample Output
+
+```
+═══════════════════════════════════════════════════════════════════
+                          DRY-RUN REPORT
+═══════════════════════════════════════════════════════════════════
+  Regime: BULL (confidence: 0.92)
+  Capital: 500000.00
+
+── APPROVED BUYS ─────────────────────────────────────────────────
+  SYMBOL       STRATEGY              PRICE         SL     TARGET    QTY  ORDER VALUE     RISK AMT
+  RELIANCE     trend_follow_v1     2450.00    2410.00    2530.00     20     49000.00       800.00
+  TCS          momentum_v1         3800.00    3750.00    3925.00     13     49400.00       650.00
+
+── REJECTED BUYS ─────────────────────────────────────────────────
+  INFY         breakout_v1   price=1650.00 qty=30 value=49500.00
+    → REJECTED: MAX_SECTOR_CONCENTRATION: already have 2 positions in sector IT
+
+── SUMMARY ───────────────────────────────────────────────────────
+  Stocks evaluated:     200
+  Strategy BUY signals: 5
+  Approved buys:        2
+  Rejected buys:        3
+  Skips:                195
+  Capital deployed:     98400.00 (19.7%)
+  Capital remaining:    401600.00
+═══════════════════════════════════════════════════════════════════
+```
 
 ---
 
