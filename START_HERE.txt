@@ -1,0 +1,283 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                ║
+║                    🚀 ALGO TRADING ENGINE - START HERE 🚀                     ║
+║                                                                                ║
+║                   Everything is ready. Just 3 simple steps.                   ║
+║                                                                                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+📋 WHAT YOU HAVE
+════════════════════════════════════════════════════════════════════════════════
+
+✅ 8 Production-Grade Scripts (4,400+ lines)
+   • setup.sh - One-command setup for everything
+   • start_engine.sh - Start trading with safety checks
+   • stop_engine.sh - Graceful shutdown
+   • health_check.sh - System monitoring
+   • cron_setup.sh - Auto-scheduling
+   • docker_setup.sh - Docker configuration
+   • cloud_deploy.sh - Cloud deployment guides
+   • install_dependencies.sh - Dependency installer
+
+✅ 5 Comprehensive Documentation Files (2,300+ lines)
+   • GET_STARTED.md - Quick start guide (READ THIS FIRST!)
+   • SETUP_SYSTEM.md - Detailed reference
+   • QUICK_START.md - Command cheatsheet
+   • PRODUCTION_WORKFLOW.md - Daily operations
+   • DEPLOYMENT_MODES.md - Mode explanation
+
+✅ Features
+   • One-command setup (handles all OS types)
+   • Local, Server, Docker, and Cloud ready
+   • Automatic daily scheduling
+   • Real-time monitoring and health checks
+   • Complete safety features for live trading
+   • Cloud deployment guides (AWS/GCP/Azure)
+
+════════════════════════════════════════════════════════════════════════════════
+🎯 3-STEP QUICK START
+════════════════════════════════════════════════════════════════════════════════
+
+STEP 1: Read the Quick Start Guide
+─────────────────────────────────────────────────────────────────────────────────
+  Run this:
+    cat GET_STARTED.md
+
+  Time: 5 minutes
+
+
+STEP 2: Configure Your Dhan Credentials
+─────────────────────────────────────────────────────────────────────────────────
+  Edit this file:
+    nano config/config.json
+
+  Update these fields:
+    • "client_id": "YOUR_DHAN_CLIENT_ID"
+    • "access_token": "YOUR_DHAN_ACCESS_TOKEN"
+    • "trading_mode": "paper"  (for testing)
+
+  Time: 2-5 minutes
+
+
+STEP 3: Run One-Command Setup
+─────────────────────────────────────────────────────────────────────────────────
+  Run this:
+    ./scripts/setup.sh
+
+  The script will:
+    ✓ Detect your OS
+    ✓ Ask deployment type (local/server/docker/cloud)
+    ✓ Install all dependencies
+    ✓ Setup database
+    ✓ Configure automatic scheduling
+    ✓ Verify everything works
+
+  Time: 5-10 minutes
+
+
+════════════════════════════════════════════════════════════════════════════════
+🚀 THEN START TRADING
+════════════════════════════════════════════════════════════════════════════════
+
+For Testing (Local Machine):
+  ./scripts/start_engine.sh
+
+For Production (Server/Automatic):
+  • Setup will configure cron jobs automatically
+  • Runs daily at 9:10 AM, closes at 3:35 PM IST
+
+For Docker:
+  docker-compose up -d
+
+For Cloud:
+  ./scripts/cloud_deploy.sh
+
+
+════════════════════════════════════════════════════════════════════════════════
+📊 DEPLOYMENT OPTIONS
+════════════════════════════════════════════════════════════════════════════════
+
+Local Machine (Testing):
+  • One-time setup
+  • Manual start/stop
+  • Best for: Testing, learning
+  • Command: ./scripts/setup.sh → ./scripts/start_engine.sh
+
+Server (Production):
+  • Automatic daily runs
+  • 8:50 AM - Fetch data
+  • 9:10 AM - Start trading
+  • 3:35 PM - Close positions
+  • Best for: Continuous trading
+  • Command: ./scripts/setup.sh (choose "Server deployment")
+
+Docker (Cloud-Ready):
+  • Containerized setup
+  • Works anywhere Docker runs
+  • Best for: Portability, cloud
+  • Command: ./scripts/setup.sh (choose "Docker deployment")
+
+Cloud (AWS/GCP/Azure):
+  • Fully managed
+  • Auto-scaling
+  • Best for: Enterprise, high-availability
+  • Command: ./scripts/cloud_deploy.sh
+
+
+════════════════════════════════════════════════════════════════════════════════
+⚙️ WHAT HAPPENS AFTER SETUP
+════════════════════════════════════════════════════════════════════════════════
+
+1. Engine fetches today's market data
+2. Engine generates AI scores for all stocks
+3. Engine evaluates 9 trading strategies
+4. Engine places trades automatically every 5 minutes
+5. Engine tracks all positions and P&L
+6. Engine logs everything for monitoring
+7. Engine stops automatically at market close
+8. Nightly jobs analyze the day's performance
+
+
+════════════════════════════════════════════════════════════════════════════════
+📈 DAILY WORKFLOW
+════════════════════════════════════════════════════════════════════════════════
+
+BEFORE MARKET (8:45-9:15 AM IST):
+  ./scripts/health_check.sh               # Verify system is ready
+  # If manual setup: ./scripts/start_engine.sh
+  # If server setup: Runs automatically
+
+DURING MARKET (9:15 AM - 3:30 PM IST):
+  tail -f logs/engine_*.log               # Monitor in real-time
+  # Watch for: [funds], [trade], [order] entries
+
+AFTER MARKET (3:35 PM onwards):
+  # Engine stops automatically
+  ./scripts/health_check.sh               # Check final status
+  # Review: logs/engine_*.log for today's trades
+
+
+════════════════════════════════════════════════════════════════════════════════
+🔒 SAFETY FEATURES
+════════════════════════════════════════════════════════════════════════════════
+
+✓ Pre-flight validation (config, database, API)
+✓ Live trading requires 2-level confirmation
+✓ Risk limits enforced (max 70% capital, 1% per trade, 3% daily loss)
+✓ Max 5 concurrent positions
+✓ Circuit breaker on repeated failures
+✓ All trades logged for audit trail
+✓ Real-time fund tracking
+✓ Position management and monitoring
+
+
+════════════════════════════════════════════════════════════════════════════════
+📚 DOCUMENTATION GUIDE
+════════════════════════════════════════════════════════════════════════════════
+
+Quick Start (Start Here):
+  cat GET_STARTED.md                      (~7 KB, 5 minutes read)
+  • 3-step setup guide
+  • Example workflows
+  • Quick troubleshooting
+
+Comprehensive Setup:
+  cat SETUP_SYSTEM.md                     (~24 KB, 15 minutes read)
+  • Detailed feature descriptions
+  • Configuration options
+  • Advanced setup
+
+Command Reference:
+  cat QUICK_START.md                      (~12 KB, 5 minutes read)
+  • All commands with examples
+  • Common workflows
+  • Troubleshooting
+
+Daily Operations:
+  cat PRODUCTION_WORKFLOW.md              (~18 KB, 10 minutes read)
+  • Hourly workflow
+  • Weekly/monthly tasks
+  • Server deployment guide
+
+Mode Explanation:
+  cat DEPLOYMENT_MODES.md                 (~15 KB, 10 minutes read)
+  • Status mode
+  • Backtest mode
+  • Paper vs Live mode
+  • Paper market mode
+
+
+════════════════════════════════════════════════════════════════════════════════
+✅ CHECKLIST
+════════════════════════════════════════════════════════════════════════════════
+
+Before Running Setup:
+  [ ] Read GET_STARTED.md
+  [ ] Updated config/config.json with your Dhan credentials
+  [ ] Verified database URL is correct
+  [ ] Set trading_mode to "paper" (for initial testing)
+  [ ] Checked risk limits are acceptable
+
+During Setup:
+  [ ] Choose deployment type (local/server/docker/cloud)
+  [ ] Let setup install all dependencies
+  [ ] Confirm each step completes successfully
+
+After Setup:
+  [ ] Run: ./scripts/health_check.sh --verbose
+  [ ] Verify: ✅ All systems ready
+  [ ] Start: ./scripts/start_engine.sh
+  [ ] Monitor: tail -f logs/engine_*.log
+
+Testing Period (1 week):
+  [ ] Paper trading running successfully
+  [ ] Results match expectations
+  [ ] No critical errors in logs
+  [ ] Ready to switch to live mode
+
+
+════════════════════════════════════════════════════════════════════════════════
+🐛 IF SOMETHING GOES WRONG
+════════════════════════════════════════════════════════════════════════════════
+
+1. Check Health:
+   ./scripts/health_check.sh --verbose
+
+2. Review Logs:
+   tail -100 logs/engine_*.log
+   tail -100 logs/setup_*.log
+
+3. Verify Config:
+   cat config/config.json | jq '.'
+
+4. Check Connectivity:
+   psql postgres://user:pass@localhost:5432/algo_trading -c "SELECT 1"
+
+5. Run Diagnostics:
+   bash -x ./scripts/setup.sh 2>&1 | tee debug.log
+
+
+════════════════════════════════════════════════════════════════════════════════
+🎯 RIGHT NOW: NEXT 15 MINUTES
+════════════════════════════════════════════════════════════════════════════════
+
+1. (2 min) Read this:
+   cat GET_STARTED.md
+
+2. (5 min) Update config:
+   nano config/config.json
+
+3. (10 min) Run setup:
+   ./scripts/setup.sh
+
+
+That's it! You're ready to trade! 🚀
+
+
+════════════════════════════════════════════════════════════════════════════════
+
+Questions? See: GET_STARTED.md or SETUP_SYSTEM.md
+Ready to start? Run: ./scripts/setup.sh
+Questions about commands? See: QUICK_START.md
+
+════════════════════════════════════════════════════════════════════════════════
