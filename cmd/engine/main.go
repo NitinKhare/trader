@@ -22,6 +22,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -50,7 +51,24 @@ func main() {
 	confirmLive := flag.Bool("confirm-live", false, "required safety flag to run in live trading mode")
 	flag.Parse()
 
-	logger := log.New(os.Stdout, "[engine] ", log.LstdFlags|log.Lshortfile)
+	// Create logs directory if it doesn't exist
+	os.MkdirAll("logs", 0755)
+
+	// Create log file with timestamp
+	logFile, err := os.OpenFile(
+		fmt.Sprintf("logs/engine_%s.log", time.Now().Format("2006-01-02_15-04-05")),
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND,
+		0644,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create log file: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
+	// Create multi-writer to log to both stdout and file
+	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	logger := log.New(multiWriter, "[engine] ", log.LstdFlags|log.Lshortfile)
 
 	// Load configuration.
 	cfg, err := config.Load(*configPath)
@@ -510,13 +528,24 @@ func registerMarketJobs(
 			// Get current holdings to detect existing positions.
 			holdings, err := b.GetHoldings(ctx)
 			if err != nil {
-				if cb != nil {
-					cb.RecordFailure(fmt.Sprintf("GetHoldings: %v", err))
+				// DH-1111 means no holdings available - this is a valid state, not an error
+				if strings.Contains(err.Error(), "DH-1111") {
+					logger.Println("[holdings] no holdings (DH-1111: valid response)")
+					holdings = []broker.Holding{}
+					if cb != nil {
+						cb.RecordSuccess()
+					}
+				} else {
+					// Other errors are actual failures
+					if cb != nil {
+						cb.RecordFailure(fmt.Sprintf("GetHoldings: %v", err))
+					}
+					return fmt.Errorf("get holdings: %w", err)
 				}
-				return fmt.Errorf("get holdings: %w", err)
-			}
-			if cb != nil {
-				cb.RecordSuccess()
+			} else {
+				if cb != nil {
+					cb.RecordSuccess()
+				}
 			}
 
 			// Reconcile DB open trades with actual broker holdings.
@@ -763,13 +792,24 @@ func registerMarketJobs(
 
 			holdings, err := b.GetHoldings(ctx)
 			if err != nil {
-				if cb != nil {
-					cb.RecordFailure(fmt.Sprintf("GetHoldings (monitor_exits): %v", err))
+				// DH-1111 means no holdings available - this is a valid state, not an error
+				if strings.Contains(err.Error(), "DH-1111") {
+					logger.Println("[holdings] no holdings (DH-1111: valid response)")
+					holdings = []broker.Holding{}
+					if cb != nil {
+						cb.RecordSuccess()
+					}
+				} else {
+					// Other errors are actual failures
+					if cb != nil {
+						cb.RecordFailure(fmt.Sprintf("GetHoldings (monitor_exits): %v", err))
+					}
+					return fmt.Errorf("get holdings: %v", err)
 				}
-				return fmt.Errorf("get holdings: %v", err)
-			}
-			if cb != nil {
-				cb.RecordSuccess()
+			} else {
+				if cb != nil {
+					cb.RecordSuccess()
+				}
 			}
 
 			if len(holdings) == 0 {
