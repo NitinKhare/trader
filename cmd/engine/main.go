@@ -2249,11 +2249,13 @@ func runBacktest(
 
 	logger.Printf("[backtest] found %d trading days with AI data: %s to %s",
 		len(dates), dates[0], dates[len(dates)-1])
+	logger.Printf("[backtest] starting capital: ₹%.2f", cfg.Capital)
 
 	// Virtual state.
 	positions := make(map[string]*backtestPosition)
 	var closedTrades []storage.TradeRecord
 	capital := cfg.Capital
+	maxCapitalUsed := 0.0
 	tradeCounter := int64(0)
 
 	for _, dateStr := range dates {
@@ -2303,11 +2305,18 @@ func runBacktest(
 		}
 
 		availableCapital := capital
+		capitalUsed := 0.0
 		for _, pos := range positions {
-			availableCapital -= pos.entryPrice * float64(pos.quantity)
+			capitalUsed += pos.entryPrice * float64(pos.quantity)
 		}
+		availableCapital = capital - capitalUsed
 		if availableCapital < 0 {
 			availableCapital = 0
+		}
+
+		// Track maximum capital used
+		if capitalUsed > maxCapitalUsed {
+			maxCapitalUsed = capitalUsed
 		}
 
 		dailyPnL := risk.DailyPnL{Date: date}
@@ -2533,6 +2542,19 @@ func runBacktest(
 	// Generate report.
 	logger.Printf("[backtest] completed: %d closed trades, %d still open at end",
 		len(closedTrades), len(positions))
+
+	// Calculate final capital (account for all closed trades)
+	finalCapital := cfg.Capital
+	for _, trade := range closedTrades {
+		finalCapital += trade.PnL
+	}
+
+	// Log capital usage summary
+	logger.Printf("[backtest] capital usage summary:")
+	logger.Printf("  Starting Capital:    ₹%.2f", cfg.Capital)
+	logger.Printf("  Maximum Used:        ₹%.2f (%.1f%% of starting)", maxCapitalUsed, (maxCapitalUsed/cfg.Capital)*100)
+	logger.Printf("  Final Capital:       ₹%.2f", finalCapital)
+	logger.Printf("  Total P&L:           ₹%.2f (%.2f%%)", finalCapital-cfg.Capital, ((finalCapital-cfg.Capital)/cfg.Capital)*100)
 
 	report := analytics.Analyze(closedTrades, cfg.Capital)
 	fmt.Println(analytics.FormatReport(report))
