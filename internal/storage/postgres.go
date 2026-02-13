@@ -240,15 +240,61 @@ func (ps *PostgresStore) UpdateTradeStopLoss(ctx context.Context, tradeID int64,
 func (ps *PostgresStore) CloseTrade(ctx context.Context, tradeID int64, exitPrice float64, exitReason string) error {
 	now := time.Now()
 	_, err := ps.db.ExecContext(ctx,
-		`UPDATE trades SET exit_price = $1, exit_time = $2, exit_reason = $3,
-		        pnl = (CASE WHEN side = 'BUY' THEN ($1 - entry_price) * quantity
-		                    ELSE (entry_price - $1) * quantity END),
-		        status = 'closed'
+		`UPDATE trades SET
+			exit_price = $1,
+			exit_time = $2,
+			exit_reason = $3,
+			exit_fill_price = $1,
+			exit_fill_time = $2,
+			exit_order_status = 'COMPLETED',
+			position_state = 'EXIT_FILLED',
+			pnl = (CASE WHEN side = 'BUY' THEN
+				(COALESCE(entry_fill_price, entry_price) - $1) * quantity
+			              ELSE
+				($1 - COALESCE(entry_fill_price, entry_price)) * quantity
+			         END),
+			status = 'closed'
 		 WHERE id = $4`,
 		exitPrice, now, exitReason, tradeID,
 	)
 	if err != nil {
 		return fmt.Errorf("close trade: %w", err)
+	}
+	return nil
+}
+
+// MarkEntryFilled records when an entry order actually fills (from broker confirmation).
+// This marks the trade as truly opened with actual fill price and time.
+func (ps *PostgresStore) MarkEntryFilled(ctx context.Context, tradeID int64, fillPrice float64) error {
+	now := time.Now()
+	_, err := ps.db.ExecContext(ctx,
+		`UPDATE trades SET
+			entry_order_status = 'COMPLETED',
+			entry_fill_price = $1,
+			entry_fill_time = $2,
+			position_state = 'ENTRY_FILLED'
+		 WHERE id = $3`,
+		fillPrice, now, tradeID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark entry filled: %w", err)
+	}
+	return nil
+}
+
+// MarkExitOrderPlaced records when an exit order is placed (waiting for fill).
+func (ps *PostgresStore) MarkExitOrderPlaced(ctx context.Context, tradeID int64, exitOrderID string, targetPrice float64) error {
+	_, err := ps.db.ExecContext(ctx,
+		`UPDATE trades SET
+			exit_order_id = $1,
+			exit_price = $2,
+			exit_order_status = 'PENDING',
+			position_state = 'EXIT_PENDING'
+		 WHERE id = $3`,
+		exitOrderID, targetPrice, tradeID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark exit order placed: %w", err)
 	}
 	return nil
 }

@@ -768,8 +768,17 @@ func registerMarketJobs(
 							fmt.Sprintf("order=%s qty=%d price=%.2f reason=%s", resp.OrderID, intent.Quantity, intent.Price, intent.Reason),
 							intent, string(regime.Regime))
 
-						// Mark trade as closed in the database.
-						closeTradeRecord(ctx, store, logger, tc, intent.Symbol, intent.Price, intent.Reason)
+						// IMPORTANT FIX: Do NOT close trade immediately. Store exit order ID and let monitor_exits
+						// check order status and use actual fill price when closing (prevents 0 P&L issue).
+						if tc != nil {
+							if trade, ok := tc.Get(intent.Symbol); ok {
+								// Store exit order details for monitor_exits to process
+								trade.OrderID = resp.OrderID  // Track exit order for status check
+								trade.ExitReason = intent.Reason
+								logger.Printf("  %s: exit order queued for status monitoring (will close when filled)",
+									intent.Symbol)
+							}
+						}
 					}
 				}
 			}
@@ -818,6 +827,10 @@ func registerMarketJobs(
 			}
 
 			logger.Printf("open positions: %d", len(holdings))
+
+			// IMPORTANT: Check if any pending exit orders have been filled and close them with actual prices.
+			// This prevents the 0 P&L issue caused by closing trades before they actually fill.
+			checkAndCloseExitOrders(ctx, b, store, logger, tc)
 
 			// Load regime for today.
 			today := time.Now().In(market.IST).Format("2006-01-02")
@@ -902,7 +915,15 @@ func registerMarketJobs(
 							} else {
 								logger.Printf("  %s: MAX HOLD EXIT ORDER PLACED — id=%s price=%.2f (held %d days)",
 									h.Symbol, resp.OrderID, exitPrice, holdDays)
-								closeTradeRecord(ctx, store, logger, tc, h.Symbol, exitPrice, "max_hold_period")
+								// IMPORTANT FIX: Do NOT close trade immediately. Store exit order for status monitoring.
+								if tc != nil {
+									if trade, ok := tc.Get(h.Symbol); ok {
+										trade.OrderID = resp.OrderID  // Track exit order for status check
+										trade.ExitReason = "max_hold_period"
+										logger.Printf("  %s: max-hold exit order queued for status monitoring (will close when filled)",
+											h.Symbol)
+									}
+								}
 								exitCount++
 							}
 							continue // skip strategy eval for this holding
@@ -985,8 +1006,15 @@ func registerMarketJobs(
 							fmt.Sprintf("order=%s qty=%d price=%.2f reason=%s", resp.OrderID, intent.Quantity, intent.Price, intent.Reason),
 							intent, string(regime.Regime))
 
-						// Mark trade as closed in the database.
-						closeTradeRecord(ctx, store, logger, tc, h.Symbol, intent.Price, intent.Reason)
+						// IMPORTANT FIX: Do NOT close trade immediately. Store exit order for status monitoring.
+						if tc != nil {
+							if trade, ok := tc.Get(h.Symbol); ok {
+								trade.OrderID = resp.OrderID  // Track exit order for status check
+								trade.ExitReason = intent.Reason
+								logger.Printf("  %s: exit order queued for status monitoring (will close when filled)",
+									h.Symbol)
+							}
+						}
 						exitCount++
 
 					} else if intent.Action == strategy.ActionHold {
@@ -1293,6 +1321,68 @@ func closeTradeRecord(
 		logger.Printf("[db] trade %d closed: %s exit=%.2f reason=%s",
 			trade.ID, symbol, exitPrice, exitReason)
 		tc.Delete(symbol)
+	}
+}
+
+// checkAndCloseExitOrders checks if any pending exit orders have been filled.
+// If filled, it closes the trade with the actual fill price (prevents 0 P&L issue).
+func checkAndCloseExitOrders(
+	ctx context.Context,
+	b broker.Broker,
+	store *storage.PostgresStore,
+	logger *log.Logger,
+	tc *tradeContext,
+) {
+	if tc == nil {
+		return
+	}
+
+	// Get all open trades (snapshot for thread-safety)
+	openTrades := tc.Snapshot()
+	for symbol, trade := range openTrades {
+		// Only process trades that have an exit order pending
+		// (OrderID would be the exit order ID if we stored it, else it's the entry order)
+		// For now, we check if ExitReason is non-empty (indicates exit was initiated)
+		if trade.ExitReason == "" {
+			continue  // No exit order pending for this trade
+		}
+
+		// Check the order status
+		orderStatus, err := b.GetOrderStatus(ctx, trade.OrderID)
+		if err != nil {
+			logger.Printf("[exit-monitor] failed to get status for %s order=%s: %v",
+				symbol, trade.OrderID, err)
+			continue
+		}
+
+		// If order is filled, close the trade with actual fill price (AveragePrice from broker)
+		if orderStatus.Status == "COMPLETED" {
+			actualFillPrice := orderStatus.AveragePrice
+			if actualFillPrice == 0 {
+				// Fallback - should not happen if COMPLETED
+				logger.Printf("[exit-monitor] %s exit order COMPLETED but AveragePrice is 0 — skipping",
+					symbol)
+				continue
+			}
+
+			logger.Printf("[exit-monitor] %s exit order FILLED at %.2f — closing trade",
+				symbol, actualFillPrice)
+
+			if err := store.CloseTrade(ctx, trade.ID, actualFillPrice, trade.ExitReason); err != nil {
+				logger.Printf("[db] failed to close trade %d: %v", trade.ID, err)
+			} else {
+				logger.Printf("[db] trade %d closed with actual fill price: %s exit=%.2f reason=%s",
+					trade.ID, symbol, actualFillPrice, trade.ExitReason)
+				tc.Delete(symbol)
+			}
+		} else if orderStatus.Status == "REJECTED" || orderStatus.Status == "CANCELLED" {
+			// Order failed - reset the exit order tracking
+			logger.Printf("[exit-monitor] %s exit order was %s — will retry on next cycle",
+				symbol, orderStatus.Status)
+			trade.ExitReason = ""  // Reset so we don't keep trying
+			trade.OrderID = ""
+		}
+		// else: order still PENDING - wait for next cycle
 	}
 }
 
