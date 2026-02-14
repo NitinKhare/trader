@@ -2,7 +2,11 @@ module github.com/nitinkhare/algoTradingAgent
 
 go 1.24.1
 
-require github.com/jackc/pgx/v5 v5.8.0
+require (
+	github.com/gorilla/websocket v1.5.3
+	github.com/jackc/pgx/v5 v5.8.0
+	github.com/lib/pq v1.11.2
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
