@@ -109,6 +109,10 @@ body {
   animation: fadeIn 0.3s ease-in;
 }
 
+.animate-fadeIn {
+  animation: fadeIn 0.3s ease-in;
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   @apply w-2 h-2;

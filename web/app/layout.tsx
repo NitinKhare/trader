@@ -17,7 +17,7 @@ export default function RootLayout({
     <html lang="en">
       <body className="bg-slate-50">
         <div className="min-h-screen flex">
-          {/* Sidebar */}
+          {/* Sidebar (fixed, with spacer) */}
           <Sidebar />
 
           {/* Main Content */}

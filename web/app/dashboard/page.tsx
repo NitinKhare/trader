@@ -22,7 +22,7 @@ export default function DashboardPage() {
 
   if (loading) {
     return (
-      <div className="space-y-6 ml-64">
+      <div className="space-y-6">
         <div className="animate-pulse space-y-4">
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {[1, 2, 3, 4, 5, 6].map((i) => (
@@ -36,7 +36,7 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="space-y-8 ml-64">
+    <div className="space-y-8">
       {/* Top Status Bar */}
       <div className="bg-gradient-to-r from-slate-900 to-slate-800 rounded-2xl shadow-xl p-6 text-white">
         <div className="flex items-center justify-between">
