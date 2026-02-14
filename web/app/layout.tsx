@@ -16,12 +16,12 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="bg-slate-50">
-        <div className="min-h-screen flex">
-          {/* Sidebar (fixed, with spacer) */}
+        <div className="min-h-screen flex flex-row">
+          {/* Sidebar returns: <> <aside fixed>...</aside> <spacer></spacer> </> */}
           <Sidebar />
 
-          {/* Main Content */}
-          <div className="flex-1 flex flex-col">
+          {/* Main Content - flex-1 to fill remaining space */}
+          <div className="flex-1 flex flex-col overflow-hidden">
             {/* Top Bar */}
             <TopBar />
 

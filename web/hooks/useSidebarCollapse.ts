@@ -1,28 +1,38 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const SIDEBAR_STORAGE_KEY = "trading-dashboard-sidebar-collapsed";
 
 export function useSidebarCollapse() {
   const [isCollapsed, setIsCollapsed] = useState(false);
-  const [isMounted, setIsMounted] = useState(false);
+  const isInitializedRef = useRef(false);
 
-  // Load from localStorage on mount
+  // Load from localStorage on mount (only once)
   useEffect(() => {
-    const saved = localStorage.getItem(SIDEBAR_STORAGE_KEY);
-    if (saved) {
-      setIsCollapsed(JSON.parse(saved));
+    if (!isInitializedRef.current) {
+      try {
+        const saved = localStorage.getItem(SIDEBAR_STORAGE_KEY);
+        if (saved !== null) {
+          setIsCollapsed(JSON.parse(saved));
+        }
+      } catch (e) {
+        console.error("Failed to load sidebar state:", e);
+      }
+      isInitializedRef.current = true;
     }
-    setIsMounted(true);
   }, []);
 
   // Save to localStorage when changed
   useEffect(() => {
-    if (isMounted) {
-      localStorage.setItem(SIDEBAR_STORAGE_KEY, JSON.stringify(isCollapsed));
+    if (isInitializedRef.current) {
+      try {
+        localStorage.setItem(SIDEBAR_STORAGE_KEY, JSON.stringify(isCollapsed));
+      } catch (e) {
+        console.error("Failed to save sidebar state:", e);
+      }
     }
-  }, [isCollapsed, isMounted]);
+  }, [isCollapsed]);
 
   const toggleSidebar = () => {
     setIsCollapsed((prev) => !prev);
@@ -31,6 +41,5 @@ export function useSidebarCollapse() {
   return {
     isCollapsed,
     toggleSidebar,
-    isMounted,
   };
 }

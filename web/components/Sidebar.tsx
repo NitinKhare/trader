@@ -12,11 +12,7 @@ const menuItems = [
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const { isCollapsed, toggleSidebar, isMounted } = useSidebarCollapse();
-
-  if (!isMounted) {
-    return null;
-  }
+  const { isCollapsed, toggleSidebar } = useSidebarCollapse();
 
   return (
     <>
@@ -39,7 +35,7 @@ export default function Sidebar() {
 
           {/* Logo Text - Hidden when collapsed */}
           {!isCollapsed && (
-            <div className="flex flex-col min-w-0 animate-fadeIn">
+            <div className="flex flex-col min-w-0">
               <h1 className="text-lg font-black text-slate-900 truncate">
                 Trading
               </h1>
@@ -127,9 +123,11 @@ export default function Sidebar() {
         </div>
       </aside>
 
-      {/* Spacer div for fixed sidebar */}
+      {/* Spacer div for fixed sidebar - maintains layout flow */}
       <div
-        className={`transition-all duration-300 ${isCollapsed ? "w-20" : "w-64"}`}
+        className={`flex-shrink-0 transition-all duration-300 ${
+          isCollapsed ? "w-20" : "w-64"
+        }`}
       ></div>
     </>
   );
