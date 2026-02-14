@@ -385,7 +385,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.respondJSON(w, http.StatusOK, resp)
 }
 
-// handleStocksList returns all unique stocks with summaries
+// handleStocksList returns all stocks from stock_universe.json with optional trade data
 func (s *Server) handleStocksList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.respondError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -394,12 +394,36 @@ func (s *Server) handleStocksList(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Read stock_universe.json
+	universeData, err := os.ReadFile("config/stock_universe.json")
+	if err != nil {
+		s.logger.Printf("failed to read stock_universe.json: %v", err)
+		s.respondError(w, http.StatusInternalServerError, "failed to read stock universe")
+		return
+	}
+
+	type StockEntry struct {
+		Symbol string `json:"symbol"`
+		Sector string `json:"sector"`
+	}
+
+	type Universe struct {
+		Stocks []StockEntry `json:"stocks"`
+	}
+
+	var universe Universe
+	if err := json.Unmarshal(universeData, &universe); err != nil {
+		s.logger.Printf("failed to parse stock_universe.json: %v", err)
+		s.respondError(w, http.StatusInternalServerError, "failed to parse stock universe")
+		return
+	}
+
 	// Get all closed trades to calculate per-stock statistics
 	trades, err := s.store.GetAllClosedTrades(ctx)
 	if err != nil {
 		s.logger.Printf("failed to get trades: %v", err)
-		s.respondError(w, http.StatusInternalServerError, "failed to fetch trades")
-		return
+		// Don't error out, just continue with no trade data
+		trades = nil
 	}
 
 	// Group trades by symbol
@@ -417,59 +441,53 @@ func (s *Server) handleStocksList(w http.ResponseWriter, r *http.Request) {
 		symbolTradeStats[trade.Symbol] = stats
 	}
 
-	// Get all unique symbols and their latest candle data
-	// We'll get this by querying the candles table for distinct symbols
-	// For now, we'll extract unique symbols from trades if they exist
-	symbolMap := make(map[string]bool)
-	for _, trade := range trades {
-		symbolMap[trade.Symbol] = true
-	}
-
-	stocks := make([]StockSummary, 0)
+	stocks := make([]StockSummary, 0, len(universe.Stocks))
 	now := time.Now()
 	oneYearAgo := now.AddDate(-1, 0, 0)
 
-	for symbol := range symbolMap {
-		// Get candles for this symbol
+	// Process all stocks from universe
+	for _, entry := range universe.Stocks {
+		symbol := entry.Symbol
+
+		// Try to get candles for this symbol (if available)
 		candles, err := s.store.GetCandles(ctx, symbol, oneYearAgo, now)
-		if err != nil || len(candles) == 0 {
-			continue
+
+		summary := StockSummary{
+			Symbol:             symbol,
+			WinningTradesCount: symbolTradeStats[symbol].winCount,
+			TotalPnL:           symbolTradeStats[symbol].totalPnL,
 		}
 
-		// Calculate stats from candles
-		high := candles[0].High
-		low := candles[0].Low
-		totalVolume := int64(0)
+		// If we have candle data, add it to the summary
+		if err == nil && len(candles) > 0 {
+			high := candles[0].High
+			low := candles[0].Low
+			totalVolume := int64(0)
 
-		for _, candle := range candles {
-			if candle.High > high {
-				high = candle.High
+			for _, candle := range candles {
+				if candle.High > high {
+					high = candle.High
+				}
+				if candle.Low < low {
+					low = candle.Low
+				}
+				totalVolume += int64(candle.Volume)
 			}
-			if candle.Low < low {
-				low = candle.Low
+
+			percentChange := 0.0
+			if candles[0].Close > 0 {
+				percentChange = ((candles[len(candles)-1].Close - candles[0].Close) / candles[0].Close) * 100
 			}
-			totalVolume += int64(candle.Volume)
+
+			summary.LatestDate = candles[len(candles)-1].Date
+			summary.LatestClose = candles[len(candles)-1].Close
+			summary.HighPrice = high
+			summary.LowPrice = low
+			summary.PercentChange = percentChange
+			summary.AverageVolume = float64(totalVolume) / float64(len(candles))
 		}
 
-		percentChange := 0.0
-		if candles[0].Close > 0 {
-			percentChange = ((candles[len(candles)-1].Close - candles[0].Close) / candles[0].Close) * 100
-		}
-
-		avgVolume := float64(totalVolume) / float64(len(candles))
-		tradeStats := symbolTradeStats[symbol]
-
-		stocks = append(stocks, StockSummary{
-			Symbol:            symbol,
-			LatestDate:        candles[len(candles)-1].Date,
-			LatestClose:       candles[len(candles)-1].Close,
-			HighPrice:         high,
-			LowPrice:          low,
-			PercentChange:     percentChange,
-			AverageVolume:     avgVolume,
-			WinningTradesCount: tradeStats.winCount,
-			TotalPnL:          tradeStats.totalPnL,
-		})
+		stocks = append(stocks, summary)
 	}
 
 	resp := StocksListResponse{
