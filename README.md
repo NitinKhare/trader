@@ -248,6 +248,14 @@ npm run dev
 
 ### Dashboard Features
 
+**0. Top Navigation Bar**
+- Direct links to navigate between pages (no need to go back to home)
+- 🏠 Home - Returns to home page
+- 📈 Dashboard - Live trading metrics and charts
+- 📚 Docs - Interactive documentation
+- Active page highlighted in blue
+- Available on all pages for easy access
+
 **1. Metrics Card**
 - Total P&L (absolute and percentage)
 - Win rate (% of winning trades)
