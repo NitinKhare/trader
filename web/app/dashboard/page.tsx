@@ -22,22 +22,21 @@ export default function DashboardPage() {
 
   if (loading) {
     return (
-      <div className="space-y-6">
+      <div className="space-y-6 ml-64">
         <div className="animate-pulse space-y-4">
-          <div className="h-20 bg-gradient-to-r from-slate-200 to-slate-100 rounded-2xl"></div>
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {[1, 2, 3, 4, 5, 6].map((i) => (
-              <div key={i} className="h-32 bg-gradient-to-r from-slate-200 to-slate-100 rounded-2xl"></div>
+              <div key={i} className="h-28 bg-slate-200 rounded-2xl"></div>
             ))}
           </div>
-          <div className="h-80 bg-gradient-to-r from-slate-200 to-slate-100 rounded-2xl"></div>
+          <div className="h-80 bg-slate-200 rounded-2xl"></div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-8 ml-64">
       {/* Top Status Bar */}
       <div className="bg-gradient-to-r from-slate-900 to-slate-800 rounded-2xl shadow-xl p-6 text-white">
         <div className="flex items-center justify-between">

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import Navigation from "@/components/Navigation";
+import Sidebar from "@/components/Sidebar";
+import TopBar from "@/components/TopBar";
 import "@/styles/globals.css";
 
 export const metadata: Metadata = {
@@ -14,34 +15,23 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>
-        <div className="min-h-screen flex flex-col">
-          <header className="bg-white border-b border-gray-200 shadow-sm">
-            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-              <div className="flex items-center justify-between py-4">
-                <div>
-                  <h1 className="text-2xl font-bold text-gray-900">
-                    📊 Trading Dashboard
-                  </h1>
-                  <p className="text-sm text-gray-600 mt-1">
-                    Real-time algorithmic trading performance monitor
-                  </p>
-                </div>
-                <Navigation />
+      <body className="bg-slate-50">
+        <div className="min-h-screen flex">
+          {/* Sidebar */}
+          <Sidebar />
+
+          {/* Main Content */}
+          <div className="flex-1 flex flex-col">
+            {/* Top Bar */}
+            <TopBar />
+
+            {/* Page Content */}
+            <main className="flex-1 overflow-auto">
+              <div className="p-8">
+                {children}
               </div>
-            </div>
-          </header>
-          <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8">
-            {children}
-          </main>
-          <footer className="bg-gray-50 border-t border-gray-200 mt-12">
-            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
-              <p className="text-sm text-gray-600">
-                Dashboard backend: http://localhost:8081 | WebSocket:
-                ws://localhost:8081/ws
-              </p>
-            </div>
-          </footer>
+            </main>
+          </div>
         </div>
       </body>
     </html>
