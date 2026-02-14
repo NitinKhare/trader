@@ -91,6 +91,8 @@ func main() {
 	mux.HandleFunc("/api/positions/open", server.handlePositionsOpen)
 	mux.HandleFunc("/api/charts/equity", server.handleChartsEquity)
 	mux.HandleFunc("/api/status", server.handleStatus)
+	mux.HandleFunc("/api/stocks/list", server.handleStocksList)
+	mux.HandleFunc("/api/stocks/candles", server.handleStockCandles)
 	mux.HandleFunc("/health", server.handleHealth)
 
 	// WebSocket endpoint for real-time updates
@@ -378,6 +380,171 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		DailyPnL:         dailyPnL,
 		Message:          fmt.Sprintf("%d positions open, ₹%.2f available", len(openTrades), availableCapital),
 		Timestamp:        time.Now(),
+	}
+
+	s.respondJSON(w, http.StatusOK, resp)
+}
+
+// handleStocksList returns all unique stocks with summaries
+func (s *Server) handleStocksList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	ctx := r.Context()
+
+	// Get all closed trades to calculate per-stock statistics
+	trades, err := s.store.GetAllClosedTrades(ctx)
+	if err != nil {
+		s.logger.Printf("failed to get trades: %v", err)
+		s.respondError(w, http.StatusInternalServerError, "failed to fetch trades")
+		return
+	}
+
+	// Group trades by symbol
+	symbolTradeStats := make(map[string]struct {
+		winCount int
+		totalPnL float64
+	})
+
+	for _, trade := range trades {
+		stats := symbolTradeStats[trade.Symbol]
+		stats.totalPnL += trade.PnL
+		if trade.PnL > 0 {
+			stats.winCount++
+		}
+		symbolTradeStats[trade.Symbol] = stats
+	}
+
+	// Get all unique symbols and their latest candle data
+	// We'll get this by querying the candles table for distinct symbols
+	// For now, we'll extract unique symbols from trades if they exist
+	symbolMap := make(map[string]bool)
+	for _, trade := range trades {
+		symbolMap[trade.Symbol] = true
+	}
+
+	stocks := make([]StockSummary, 0)
+	now := time.Now()
+	oneYearAgo := now.AddDate(-1, 0, 0)
+
+	for symbol := range symbolMap {
+		// Get candles for this symbol
+		candles, err := s.store.GetCandles(ctx, symbol, oneYearAgo, now)
+		if err != nil || len(candles) == 0 {
+			continue
+		}
+
+		// Calculate stats from candles
+		high := candles[0].High
+		low := candles[0].Low
+		totalVolume := int64(0)
+
+		for _, candle := range candles {
+			if candle.High > high {
+				high = candle.High
+			}
+			if candle.Low < low {
+				low = candle.Low
+			}
+			totalVolume += int64(candle.Volume)
+		}
+
+		percentChange := 0.0
+		if candles[0].Close > 0 {
+			percentChange = ((candles[len(candles)-1].Close - candles[0].Close) / candles[0].Close) * 100
+		}
+
+		avgVolume := float64(totalVolume) / float64(len(candles))
+		tradeStats := symbolTradeStats[symbol]
+
+		stocks = append(stocks, StockSummary{
+			Symbol:            symbol,
+			LatestDate:        candles[len(candles)-1].Date,
+			LatestClose:       candles[len(candles)-1].Close,
+			HighPrice:         high,
+			LowPrice:          low,
+			PercentChange:     percentChange,
+			AverageVolume:     avgVolume,
+			WinningTradesCount: tradeStats.winCount,
+			TotalPnL:          tradeStats.totalPnL,
+		})
+	}
+
+	resp := StocksListResponse{
+		Stocks:    stocks,
+		Timestamp: time.Now(),
+	}
+
+	s.respondJSON(w, http.StatusOK, resp)
+}
+
+// handleStockCandles returns OHLCV data for a specific stock
+func (s *Server) handleStockCandles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.respondError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Parse query parameters
+	symbol := r.URL.Query().Get("symbol")
+	if symbol == "" {
+		s.respondError(w, http.StatusBadRequest, "symbol query parameter required")
+		return
+	}
+
+	// Parse date range
+	fromStr := r.URL.Query().Get("from")
+	toStr := r.URL.Query().Get("to")
+
+	now := time.Now()
+	from := now.AddDate(-1, 0, 0) // Default: last 1 year
+	to := now
+
+	if fromStr != "" {
+		parsedFrom, err := time.Parse("2006-01-02", fromStr)
+		if err == nil {
+			from = parsedFrom
+		}
+	}
+
+	if toStr != "" {
+		parsedTo, err := time.Parse("2006-01-02", toStr)
+		if err == nil {
+			to = parsedTo
+		}
+	}
+
+	ctx := r.Context()
+
+	// Get candles from database
+	candles, err := s.store.GetCandles(ctx, symbol, from, to)
+	if err != nil {
+		s.logger.Printf("failed to get candles for %s: %v", symbol, err)
+		s.respondError(w, http.StatusInternalServerError, "failed to fetch candles")
+		return
+	}
+
+	// Convert to CandleData
+	candleData := make([]CandleData, len(candles))
+	for i, candle := range candles {
+		candleData[i] = CandleData{
+			Date:   candle.Date,
+			Open:   candle.Open,
+			High:   candle.High,
+			Low:    candle.Low,
+			Close:  candle.Close,
+			Volume: candle.Volume,
+		}
+	}
+
+	resp := StockCandlesResponse{
+		Symbol:    symbol,
+		Candles:   candleData,
+		FromDate:  from,
+		ToDate:    to,
+		Timestamp: time.Now(),
 	}
 
 	s.respondJSON(w, http.StatusOK, resp)

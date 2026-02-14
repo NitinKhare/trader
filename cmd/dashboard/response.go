@@ -85,3 +85,41 @@ type ErrorResponse struct {
 	Code    int       `json:"code"`
 	Timestamp time.Time `json:"timestamp"`
 }
+
+// CandleData represents a single OHLCV candlestick
+type CandleData struct {
+	Date   time.Time `json:"date"`
+	Open   float64   `json:"open"`
+	High   float64   `json:"high"`
+	Low    float64   `json:"low"`
+	Close  float64   `json:"close"`
+	Volume int64     `json:"volume"`
+}
+
+// StockSummary represents a stock in the list view with stats
+type StockSummary struct {
+	Symbol            string    `json:"symbol"`
+	LatestDate        time.Time `json:"latest_date"`
+	LatestClose       float64   `json:"latest_close"`
+	HighPrice         float64   `json:"high_price"`
+	LowPrice          float64   `json:"low_price"`
+	PercentChange     float64   `json:"percent_change"`     // % change from first to latest
+	AverageVolume     float64   `json:"average_volume"`
+	WinningTradesCount int      `json:"winning_trades_count"`
+	TotalPnL          float64   `json:"total_pnl"`
+}
+
+// StocksListResponse contains all stocks with their summaries
+type StocksListResponse struct {
+	Stocks    []StockSummary `json:"stocks"`
+	Timestamp time.Time      `json:"timestamp"`
+}
+
+// StockCandlesResponse contains OHLCV data for a specific stock
+type StockCandlesResponse struct {
+	Symbol    string        `json:"symbol"`
+	Candles   []CandleData  `json:"candles"`
+	FromDate  time.Time     `json:"from_date"`
+	ToDate    time.Time     `json:"to_date"`
+	Timestamp time.Time     `json:"timestamp"`
+}

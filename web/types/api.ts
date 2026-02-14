@@ -87,3 +87,38 @@ export interface DashboardData {
   error: string | null;
   connected: boolean;
 }
+
+// Stock-related types
+export interface Candle {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface StockSummary {
+  symbol: string;
+  latest_date: string;
+  latest_close: number;
+  high_price: number;
+  low_price: number;
+  percent_change: number;
+  average_volume: number;
+  winning_trades_count: number;
+  total_pnl: number;
+}
+
+export interface StocksListResponse {
+  stocks: StockSummary[];
+  timestamp: string;
+}
+
+export interface StockCandlesResponse {
+  symbol: string;
+  candles: Candle[];
+  from_date: string;
+  to_date: string;
+  timestamp: string;
+}
