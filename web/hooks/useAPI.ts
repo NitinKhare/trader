@@ -17,12 +17,21 @@ export function useAPI<T>(endpoint: string): UseAPIState<T> {
 
   useEffect(() => {
     let isMounted = true;
+    let timeoutId: NodeJS.Timeout;
 
     const fetchData = async () => {
       try {
         setState((prev) => ({ ...prev, loading: true, error: null }));
 
-        const response = await fetch(`${API_BASE_URL}${endpoint}`);
+        // Set a 5-second timeout for the fetch
+        const controller = new AbortController();
+        timeoutId = setTimeout(() => controller.abort(), 5000);
+
+        const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
           throw new Error(
@@ -37,8 +46,16 @@ export function useAPI<T>(endpoint: string): UseAPIState<T> {
         }
       } catch (err) {
         if (isMounted) {
-          const errorMessage =
-            err instanceof Error ? err.message : "Unknown error";
+          let errorMessage = "Unknown error";
+
+          if (err instanceof Error) {
+            if (err.name === "AbortError") {
+              errorMessage = "Request timeout - Backend not responding";
+            } else {
+              errorMessage = err.message;
+            }
+          }
+
           setState({ data: null, loading: false, error: errorMessage });
           console.error(`Error fetching ${endpoint}:`, err);
         }
@@ -49,6 +66,7 @@ export function useAPI<T>(endpoint: string): UseAPIState<T> {
 
     return () => {
       isMounted = false;
+      clearTimeout(timeoutId);
     };
   }, [endpoint]);
 

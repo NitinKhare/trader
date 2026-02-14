@@ -65,6 +65,13 @@ export function useMetrics(): UsemeticsState {
       equityCurveRest.error ||
       statusRest.error;
 
+    const errorMessage =
+      metricsRest.error ||
+      positionsRest.error ||
+      equityCurveRest.error ||
+      statusRest.error ||
+      null;
+
     setState((prev) => ({
       ...prev,
       metrics: metricsRest.data || prev.metrics,
@@ -72,18 +79,22 @@ export function useMetrics(): UsemeticsState {
       equityCurve: equityCurveRest.data || prev.equityCurve,
       status: statusRest.data || prev.status,
       loading: !allLoaded,
-      error: hasError ? "Failed to load some data" : null,
+      error: errorMessage,
       lastUpdate: allLoaded && !prev.lastUpdate ? new Date() : prev.lastUpdate,
     }));
   }, [
     metricsRest.data,
     metricsRest.loading,
+    metricsRest.error,
     positionsRest.data,
     positionsRest.loading,
+    positionsRest.error,
     equityCurveRest.data,
     equityCurveRest.loading,
+    equityCurveRest.error,
     statusRest.data,
     statusRest.loading,
+    statusRest.error,
   ]);
 
   // Update connection status

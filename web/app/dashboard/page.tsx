@@ -17,12 +17,18 @@ import {
 } from "recharts";
 
 export default function DashboardPage() {
-  const { metrics, positions, equityCurve, status, loading, connected } =
+  const { metrics, positions, equityCurve, status, loading, connected, error } =
     useMetrics();
 
   if (loading) {
     return (
       <div className="space-y-6">
+        <div className="bg-blue-50 border border-blue-200 rounded-2xl p-6">
+          <p className="text-blue-800 font-semibold">Loading dashboard...</p>
+          <p className="text-blue-700 text-sm mt-2">
+            Make sure the backend is running: <code className="bg-blue-100 px-2 py-1 rounded text-xs font-mono">./dashboard --port 8081</code>
+          </p>
+        </div>
         <div className="animate-pulse space-y-4">
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {[1, 2, 3, 4, 5, 6].map((i) => (
@@ -30,6 +36,27 @@ export default function DashboardPage() {
             ))}
           </div>
           <div className="h-80 bg-slate-200 rounded-2xl"></div>
+        </div>
+      </div>
+    );
+  }
+
+  // Show error message if backend is not responding
+  if (error) {
+    return (
+      <div className="space-y-6">
+        <div className="bg-red-50 border-2 border-red-200 rounded-2xl p-6">
+          <h2 className="text-red-800 font-black text-lg mb-2">⚠️ Backend Not Running</h2>
+          <p className="text-red-700 mb-4">
+            The dashboard backend is not responding. Please start it first:
+          </p>
+          <div className="bg-red-100 rounded-lg p-4 font-mono text-sm text-red-900 mb-4 overflow-x-auto space-y-1">
+            <div>$ cd /Users/nitinkhare/Downloads/algoTradingAgent</div>
+            <div>$ ./dashboard --port 8081</div>
+          </div>
+          <p className="text-red-700 text-sm">
+            Error: {error}
+          </p>
         </div>
       </div>
     );
