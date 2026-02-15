@@ -122,3 +122,134 @@ export interface StockCandlesResponse {
   to_date: string;
   timestamp: string;
 }
+
+// Backtest-related types
+export interface StrategyParameter {
+  name: string;
+  type: "float" | "int" | "bool" | "string";
+  display_name: string;
+  default: number | string | boolean;
+  min?: number | string;
+  max?: number | string;
+  step?: number;
+  description?: string;
+}
+
+export interface StrategyInfo {
+  id: string;
+  name: string;
+  description: string;
+  parameters: StrategyParameter[];
+}
+
+export interface StrategiesResponse {
+  strategies: StrategyInfo[];
+  timestamp: string;
+}
+
+export interface BacktestRunRequest {
+  name: string;
+  strategy_id: string;
+  stocks?: string[] | null;
+  parameters: Record<string, any>;
+  date_from: string;
+  date_to: string;
+}
+
+export interface BacktestRun {
+  id: string;
+  name: string;
+  strategy_id: string;
+  stocks?: string[] | null;
+  parameters: Record<string, any>;
+  date_from: string;
+  date_to: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED";
+  progress_percent: number;
+  error_message?: string;
+  started_at?: string;
+  completed_at?: string;
+  created_at: string;
+}
+
+export interface BacktestResults {
+  id: string;
+  backtest_run_id: string;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  win_rate: number;
+  total_pnl: number;
+  pnl_percent: number;
+  profit_factor: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  max_drawdown_date: string;
+  avg_hold_days: number;
+  best_trade_pnl: number;
+  worst_trade_pnl: number;
+  created_at: string;
+}
+
+export interface BacktestTrade {
+  id: string;
+  backtest_run_id: string;
+  symbol: string;
+  entry_date: string;
+  exit_date: string;
+  entry_price: number;
+  exit_price: number;
+  quantity: number;
+  pnl: number;
+  pnl_percent: number;
+  exit_reason: string;
+  created_at: string;
+}
+
+export interface BacktestEquityCurvePoint {
+  date: string;
+  equity: number;
+  drawdown: number;
+}
+
+export interface BacktestRunResponse {
+  backtest_run_id: string;
+  status: string;
+  message: string;
+  timestamp: string;
+}
+
+export interface BacktestDetailResponse {
+  backtest_run: BacktestRun;
+  results: BacktestResults;
+  trades: BacktestTrade[];
+  equity_curve: BacktestEquityCurvePoint[];
+  timestamp: string;
+}
+
+export interface BacktestListResponse {
+  runs: BacktestRun[];
+  total_count: number;
+  limit: number;
+  offset: number;
+  timestamp: string;
+}
+
+export interface BacktestComparisonMetric {
+  backtest_run_id: string;
+  name: string;
+  strategy_id: string;
+  total_trades: number;
+  win_rate: number;
+  total_pnl: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  profit_factor: number;
+  created_at: string;
+}
+
+export interface BacktestComparisonResponse {
+  comparison: BacktestComparisonMetric[];
+  best_by: Record<string, string>;
+  timestamp: string;
+}

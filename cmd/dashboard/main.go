@@ -93,6 +93,11 @@ func main() {
 	mux.HandleFunc("/api/status", server.handleStatus)
 	mux.HandleFunc("/api/stocks/list", server.handleStocksList)
 	mux.HandleFunc("/api/stocks/candles", server.handleStockCandles)
+	mux.HandleFunc("/api/backtest/run", server.handleBacktestRun)
+	mux.HandleFunc("/api/backtest/strategies", server.handleBacktestStrategies)
+	mux.HandleFunc("/api/backtest/runs", server.handleBacktestRuns)
+	mux.HandleFunc("/api/backtest/results/", server.handleBacktestResults)
+	mux.HandleFunc("/api/backtest/compare", server.handleBacktestCompare)
 	mux.HandleFunc("/health", server.handleHealth)
 
 	// WebSocket endpoint for real-time updates

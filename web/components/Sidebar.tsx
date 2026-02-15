@@ -7,6 +7,7 @@ import { useSidebarCollapse } from "@/hooks/useSidebarCollapse";
 const menuItems = [
   { icon: "📊", label: "Dashboard", href: "/dashboard" },
   { icon: "📈", label: "Stocks", href: "/stocks" },
+  { icon: "🔬", label: "Backtest", href: "/backtest" },
   { icon: "📚", label: "Documentation", href: "/docs" },
   { icon: "🏠", label: "Home", href: "/" },
 ];
