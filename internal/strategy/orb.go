@@ -72,8 +72,9 @@ func NewORBStrategy(riskCfg config.RiskConfig) *ORBStrategy {
 	}
 }
 
-func (s *ORBStrategy) ID() string   { return "orb_v1" }
-func (s *ORBStrategy) Name() string { return "Opening Range Breakout" }
+func (s *ORBStrategy) ID() string               { return "orb_v1" }
+func (s *ORBStrategy) Name() string             { return "Opening Range Breakout" }
+func (s *ORBStrategy) GetStrategyType() StrategyType { return StrategyTypeBreakout }
 
 // Evaluate applies the ORB rules to produce a TradeIntent.
 func (s *ORBStrategy) Evaluate(input StrategyInput) TradeIntent {

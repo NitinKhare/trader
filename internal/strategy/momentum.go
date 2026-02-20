@@ -72,8 +72,9 @@ func NewMomentumStrategy(riskCfg config.RiskConfig) *MomentumStrategy {
 	}
 }
 
-func (s *MomentumStrategy) ID() string   { return "momentum_v1" }
-func (s *MomentumStrategy) Name() string { return "Momentum Swing" }
+func (s *MomentumStrategy) ID() string               { return "momentum_v1" }
+func (s *MomentumStrategy) Name() string             { return "Momentum Swing" }
+func (s *MomentumStrategy) GetStrategyType() StrategyType { return StrategyTypeMomentum }
 
 // Evaluate applies the momentum rules to produce a TradeIntent.
 func (s *MomentumStrategy) Evaluate(input StrategyInput) TradeIntent {

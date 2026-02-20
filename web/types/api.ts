@@ -253,3 +253,73 @@ export interface BacktestComparisonResponse {
   best_by: Record<string, string>;
   timestamp: string;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Portfolio & Regime Types
+// ────────────────────────────────────────────────────────────────────
+
+export interface RegimeResponse {
+  ai_regime: string;
+  detected_regime: string;
+  adx: number;
+  atr_percentile: number;
+  volatility: number;
+  confidence: number;
+  timestamp: string;
+}
+
+export interface StrategyAllocationItem {
+  strategy_id: string;
+  strategy_type: string;
+  capital_pct: number;
+  capital: number;
+  rolling_sharpe: number;
+  win_rate: number;
+  trade_count: number;
+}
+
+export interface StrategyAllocationResponse {
+  allocations: StrategyAllocationItem[];
+  mode: string;
+  timestamp: string;
+}
+
+export interface ExtendedMetricsResponse {
+  total_pnl: number;
+  win_rate: number;
+  sharpe_ratio: number;
+  max_drawdown: number;
+  profit_factor: number;
+  total_trades: number;
+  cagr: number;
+  sortino_ratio: number;
+  calmar_ratio: number;
+  expectancy: number;
+  avg_r_multiple: number;
+  payoff_ratio: number;
+  recovery_factor: number;
+  max_consecutive_wins: number;
+  max_consecutive_losses: number;
+  timestamp: string;
+}
+
+export interface StrategyPerformanceItem {
+  strategy_id: string;
+  total_trades: number;
+  win_rate: number;
+  total_pnl: number;
+  avg_pnl: number;
+  rolling_sharpe: number;
+  max_drawdown: number;
+}
+
+export interface StrategyPerformanceResponse {
+  strategies: StrategyPerformanceItem[];
+  timestamp: string;
+}
+
+export interface CorrelationResponse {
+  symbols: string[];
+  matrix: number[][];
+  timestamp: string;
+}

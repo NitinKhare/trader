@@ -58,8 +58,9 @@ func NewTrendFollowStrategy(riskCfg config.RiskConfig) *TrendFollowStrategy {
 	}
 }
 
-func (s *TrendFollowStrategy) ID() string   { return "trend_follow_v1" }
-func (s *TrendFollowStrategy) Name() string { return "Trend Following Swing" }
+func (s *TrendFollowStrategy) ID() string               { return "trend_follow_v1" }
+func (s *TrendFollowStrategy) Name() string             { return "Trend Following Swing" }
+func (s *TrendFollowStrategy) GetStrategyType() StrategyType { return StrategyTypeTrend }
 
 // Evaluate applies the trend-following rules to produce a TradeIntent.
 func (s *TrendFollowStrategy) Evaluate(input StrategyInput) TradeIntent {

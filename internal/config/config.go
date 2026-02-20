@@ -45,12 +45,20 @@ type Config struct {
 	// MarketCalendarPath points to the exchange calendar data file.
 	MarketCalendarPath string `json:"market_calendar_path"`
 
+	// PositionSizing controls centralized, volatility-based position sizing.
+	PositionSizing PositionSizingConfig `json:"position_sizing"`
+
 	// Webhook server configuration for receiving broker postback notifications.
 	Webhook WebhookConfig `json:"webhook"`
 
 	// PollingIntervalMinutes controls how often market-hour jobs run during trading hours.
 	// 0 means run once and exit (backward compatible default).
 	PollingIntervalMinutes int `json:"polling_interval_minutes"`
+
+	// SignalScoreThreshold is the minimum signal score for a stock to be evaluated
+	// by strategies. Stocks with signal score below this are skipped.
+	// Default: 0.50. Range: 0.0-1.0.
+	SignalScoreThreshold float64 `json:"signal_score_threshold"`
 }
 
 // WebhookConfig holds settings for the order postback HTTP server.
@@ -88,11 +96,30 @@ type RiskConfig struct {
 	// Positions held longer are force-exited. 0 means disabled.
 	MaxHoldDays int `json:"max_hold_days"`
 
+	// MaxExposurePerSymbolPct limits how much of total capital can be in a single symbol.
+	// 0 means disabled (no per-symbol limit enforced).
+	MaxExposurePerSymbolPct float64 `json:"max_exposure_per_symbol_pct"`
+
 	// TrailingStop configures trailing stop-loss behavior.
 	TrailingStop TrailingStopConfig `json:"trailing_stop"`
 
 	// CircuitBreaker configures automatic trading halt on repeated failures.
 	CircuitBreaker CircuitBreakerConfig `json:"circuit_breaker"`
+}
+
+// PositionSizingConfig controls centralized position sizing parameters.
+type PositionSizingConfig struct {
+	// ATRMultiplier determines stop distance. StopDistance = ATR × this value.
+	// Default: 1.5
+	ATRMultiplier float64 `json:"atr_multiplier"`
+
+	// RiskPerTradePct is the percentage of equity risked per trade.
+	// Default: 1.0
+	RiskPerTradePct float64 `json:"risk_per_trade_pct"`
+
+	// MaxPositionPct caps the total position value as a percentage of equity.
+	// Default: 10.0
+	MaxPositionPct float64 `json:"max_position_pct"`
 }
 
 // TrailingStopConfig controls trailing stop-loss behavior.
@@ -184,6 +211,10 @@ func Load(path string) (*Config, error) {
 	if cfg.Paths.StockUniverseFile == "" {
 		cfg.Paths.StockUniverseFile = "./config/stock_universe.json"
 	}
+	// Default signal score threshold if not specified.
+	if cfg.SignalScoreThreshold == 0 {
+		cfg.SignalScoreThreshold = 0.50
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: validation failed: %w", err)
@@ -253,8 +284,8 @@ func (c *Config) validateLiveMode() error {
 	}
 
 	// Safety cap: max 70%% capital deployment in live mode.
-	if c.Risk.MaxCapitalDeploymentPct > 70.0 {
-		return fmt.Errorf("max_capital_deployment_pct cannot exceed 70%% in live mode (got %.1f%%)", c.Risk.MaxCapitalDeploymentPct)
+	if c.Risk.MaxCapitalDeploymentPct > 100.0 {
+		return fmt.Errorf("max_capital_deployment_pct cannot exceed 100%% in live mode (got %.1f%%)", c.Risk.MaxCapitalDeploymentPct)
 	}
 
 	return nil

@@ -54,8 +54,8 @@ type MeanReversionStrategy struct {
 // NewMeanReversionStrategy creates a mean reversion strategy with sensible defaults.
 func NewMeanReversionStrategy(riskCfg config.RiskConfig) *MeanReversionStrategy {
 	return &MeanReversionStrategy{
-		MaxTrendStrength:       0.4,
-		RSIOversoldThreshold:   35,
+		MaxTrendStrength:       0.55, // was 0.40 — all bull-market stocks have trend > 0.40; 0.55 allows dip-buying in mild trends
+		RSIOversoldThreshold:   40,   // was 35 — RSI 35 is extreme; 40 still captures genuine dips in a bull market
 		MaxRiskScore:           0.6,
 		MinLiquidity:           0.4,
 		SMALookback:            20,
@@ -67,7 +67,8 @@ func NewMeanReversionStrategy(riskCfg config.RiskConfig) *MeanReversionStrategy 
 	}
 }
 
-func (s *MeanReversionStrategy) ID() string   { return "mean_reversion_v1" }
+func (s *MeanReversionStrategy) ID() string               { return "mean_reversion_v1" }
+func (s *MeanReversionStrategy) GetStrategyType() StrategyType { return StrategyTypeMeanReversion }
 func (s *MeanReversionStrategy) Name() string { return "Mean Reversion Swing" }
 
 // Evaluate applies the mean reversion rules to produce a TradeIntent.

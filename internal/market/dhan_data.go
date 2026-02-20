@@ -66,14 +66,28 @@ type dhanChartRequest struct {
 	ToDate          string `json:"toDate"`
 }
 
+// flexInt64 is an int64 that can be unmarshalled from JSON numbers including
+// scientific notation floats (e.g., 1.0985697E7) which Dhan returns for
+// older historical volume data.
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(b []byte) error {
+	var v float64
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	*f = flexInt64(int64(v))
+	return nil
+}
+
 // dhanChartResponse is the JSON response from Dhan historical API.
 type dhanChartResponse struct {
-	Open      []float64 `json:"open"`
-	High      []float64 `json:"high"`
-	Low       []float64 `json:"low"`
-	Close     []float64 `json:"close"`
-	Volume    []int64   `json:"volume"`
-	Timestamp []int64   `json:"timestamp"`
+	Open      []float64   `json:"open"`
+	High      []float64   `json:"high"`
+	Low       []float64   `json:"low"`
+	Close     []float64   `json:"close"`
+	Volume    []flexInt64 `json:"volume"`
+	Timestamp []flexInt64 `json:"timestamp"`
 }
 
 // NewDhanDataProvider creates a new Dhan data provider.
@@ -162,7 +176,7 @@ func (d *DhanDataProvider) FetchDailyCandles(ctx context.Context, symbol string,
 		// Convert response arrays to candles.
 		if resp != nil && len(resp.Timestamp) > 0 {
 			for i := range resp.Timestamp {
-				t := time.Unix(resp.Timestamp[i], 0).In(IST)
+				t := time.Unix(int64(resp.Timestamp[i]), 0).In(IST)
 				allCandles = append(allCandles, strategy.Candle{
 					Symbol: symbol,
 					Date:   time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, IST),
@@ -170,7 +184,7 @@ func (d *DhanDataProvider) FetchDailyCandles(ctx context.Context, symbol string,
 					High:   resp.High[i],
 					Low:    resp.Low[i],
 					Close:  resp.Close[i],
-					Volume: resp.Volume[i],
+					Volume: int64(resp.Volume[i]),
 				})
 			}
 		}

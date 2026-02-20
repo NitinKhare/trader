@@ -72,8 +72,9 @@ func NewMACDCrossoverStrategy(riskCfg config.RiskConfig) *MACDCrossoverStrategy 
 	}
 }
 
-func (s *MACDCrossoverStrategy) ID() string   { return "macd_crossover_v1" }
-func (s *MACDCrossoverStrategy) Name() string { return "MACD Crossover" }
+func (s *MACDCrossoverStrategy) ID() string               { return "macd_crossover_v1" }
+func (s *MACDCrossoverStrategy) Name() string             { return "MACD Crossover" }
+func (s *MACDCrossoverStrategy) GetStrategyType() StrategyType { return StrategyTypeMomentum }
 
 // Evaluate applies the MACD crossover rules to produce a TradeIntent.
 func (s *MACDCrossoverStrategy) Evaluate(input StrategyInput) TradeIntent {

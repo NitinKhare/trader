@@ -106,6 +106,7 @@ func (m *Manager) Validate(
 		m.checkMaxCapitalDeployment(&result, intent, openPositions, availableCapital)
 		m.checkPositionSize(&result, intent, availableCapital)
 		m.checkSectorConcentration(&result, intent, openPositions, sectorMap)
+		m.checkMaxExposurePerSymbol(&result, intent, openPositions)
 	}
 
 	return result
@@ -229,6 +230,33 @@ func (m *Manager) checkSectorConcentration(result *ValidationResult, intent stra
 		m.reject(result, "MAX_SECTOR_CONCENTRATION", fmt.Sprintf(
 			"already have %d positions in sector %s (max %d)",
 			sectorCount, intentSector, m.config.MaxPerSector,
+		))
+	}
+}
+
+// checkMaxExposurePerSymbol ensures the total exposure to a single symbol
+// doesn't exceed the configured percentage of capital.
+// If MaxExposurePerSymbolPct is 0, this check is disabled.
+func (m *Manager) checkMaxExposurePerSymbol(result *ValidationResult, intent strategy.TradeIntent, positions []strategy.PositionInfo) {
+	if m.config.MaxExposurePerSymbolPct <= 0 {
+		return // check disabled
+	}
+
+	// Sum existing exposure to this symbol.
+	var existingExposure float64
+	for _, pos := range positions {
+		if pos.Symbol == intent.Symbol {
+			existingExposure += pos.EntryPrice * float64(pos.Quantity)
+		}
+	}
+
+	proposedExposure := existingExposure + intent.Price*float64(intent.Quantity)
+	maxExposure := m.totalCapital * (m.config.MaxExposurePerSymbolPct / 100.0)
+
+	if proposedExposure > maxExposure {
+		m.reject(result, "MAX_EXPOSURE_PER_SYMBOL", fmt.Sprintf(
+			"exposure to %s would be %.2f, exceeds limit %.2f (%.1f%% of %.2f)",
+			intent.Symbol, proposedExposure, maxExposure, m.config.MaxExposurePerSymbolPct, m.totalCapital,
 		))
 	}
 }

@@ -13,7 +13,10 @@ import (
 
 	"github.com/nitinkhare/algoTradingAgent/internal/broker"
 	"github.com/nitinkhare/algoTradingAgent/internal/config"
+	"github.com/nitinkhare/algoTradingAgent/internal/features"
 	"github.com/nitinkhare/algoTradingAgent/internal/market"
+	"github.com/nitinkhare/algoTradingAgent/internal/portfolio"
+	"github.com/nitinkhare/algoTradingAgent/internal/regime"
 	"github.com/nitinkhare/algoTradingAgent/internal/risk"
 	"github.com/nitinkhare/algoTradingAgent/internal/scheduler"
 	"github.com/nitinkhare/algoTradingAgent/internal/storage"
@@ -99,7 +102,13 @@ func runJobsDirectly(t *testing.T, cfg *config.Config,
 	t.Helper()
 	cal := market.NewCalendarFromHolidays(map[string]string{})
 	sched := scheduler.New(cal, logger)
-	registerMarketJobs(sched, cfg, b, strats, riskMgr, nil, nil, nil, nil, nil, logger)
+	registerMarketJobs(sched, cfg, b, strats, riskMgr, nil, nil, nil, nil, nil, logger,
+		regime.NewDetector(), regime.NewStrategySelector(),
+		risk.NewPositionSizer(risk.PositionSizerConfig{}),
+		portfolio.NewAllocator(cfg.Capital, portfolio.AllocationEqual),
+		portfolio.NewCorrelationEngine(0.75, 30),
+		portfolio.NewPerformanceMonitor(30),
+		features.NewGenerator(), features.NewSignalScorer())
 	ctx := context.Background()
 	if err := sched.ForceRunMarketHourJobs(ctx); err != nil {
 		t.Fatalf("ForceRunMarketHourJobs failed: %v", err)
@@ -166,9 +175,9 @@ func TestPaperMode_EndToEnd(t *testing.T) {
 	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
 
 	// ── 3. Create candle data (50 candles each for ATR calculation) ──
-	writeTrendingCandles(t, dataDir, "TESTSTOCK1", 50, 500.0)
-	writeTrendingCandles(t, dataDir, "TESTSTOCK2", 50, 200.0)
-	writeTrendingCandles(t, dataDir, "TESTSTOCK3", 50, 100.0)
+	writeTrendingCandles(t, dataDir, "TESTSTOCK1", 100, 500.0)
+	writeTrendingCandles(t, dataDir, "TESTSTOCK2", 100, 200.0)
+	writeTrendingCandles(t, dataDir, "TESTSTOCK3", 100, 100.0)
 
 	// ── 4. Create config ──
 	cfg := &config.Config{
@@ -293,7 +302,7 @@ func TestPaperMode_ExitMonitoring(t *testing.T) {
 	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
 
 	// Candle data for EXITSTOCK.
-	writeTrendingCandles(t, dataDir, "EXITSTOCK", 50, 300.0)
+	writeTrendingCandles(t, dataDir, "EXITSTOCK", 100, 300.0)
 
 	cfg := &config.Config{
 		ActiveBroker: "dhan",
@@ -397,7 +406,7 @@ func TestPaperMode_RiskRejection(t *testing.T) {
 			CompositeScore:       0.75,
 			Rank:                 i,
 		})
-		writeTrendingCandles(t, dataDir, sym, 50, 100.0+float64(i)*50)
+		writeTrendingCandles(t, dataDir, sym, 100, 100.0+float64(i)*50)
 	}
 	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
 
@@ -811,7 +820,7 @@ func TestPaperMode_BuyWithStopLoss(t *testing.T) {
 		CompositeScore: 0.85, Rank: 1,
 	}}
 	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
-	writeTrendingCandles(t, dataDir, "SLTEST", 50, 500.0)
+	writeTrendingCandles(t, dataDir, "SLTEST", 100, 500.0)
 
 	cfg := &config.Config{
 		ActiveBroker: "dhan", TradingMode: config.ModePaper, Capital: 500000.0,
@@ -889,8 +898,8 @@ func TestDryRun_PrintsReport(t *testing.T) {
 	writeJSON(t, filepath.Join(todayDir, "stock_scores.json"), scores)
 
 	// Create candle data.
-	writeTrendingCandles(t, dataDir, "DRYTEST1", 50, 500.0)
-	writeTrendingCandles(t, dataDir, "DRYTEST2", 50, 100.0)
+	writeTrendingCandles(t, dataDir, "DRYTEST1", 100, 500.0)
+	writeTrendingCandles(t, dataDir, "DRYTEST2", 100, 100.0)
 
 	cfg := &config.Config{
 		ActiveBroker: "dhan",

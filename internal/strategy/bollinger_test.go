@@ -9,6 +9,7 @@ import (
 
 // makeBollingerSqueezeCandles creates candles with a tight consolidation (squeeze)
 // followed by a breakout candle that closes above the upper Bollinger Band.
+// The data includes a gradual uptrend in the second half to produce ADX > 20.
 func makeBollingerSqueezeCandles(n int, basePrice float64) []Candle {
 	candles := make([]Candle, n)
 	for i := 0; i < n; i++ {
@@ -18,13 +19,20 @@ func makeBollingerSqueezeCandles(n int, basePrice float64) []Candle {
 		vol := int64(100000)
 
 		if i == n-1 {
-			// Breakout candle: jumps above upper band with volume.
-			price = basePrice + 8.0
+			// Breakout candle: jumps above upper band with strong volume.
+			price = basePrice + 10.0
 			highSpread = 3.0
 			lowSpread = 1.0
-			vol = 200000
+			vol = 300000 // 3× average to pass 2.0× threshold
+		} else if i > n/2 {
+			// Second half: gradual uptrend to build ADX.
+			// Small but consistent directional moves create ADX > 20.
+			drift := float64(i-n/2) * 0.15
+			price = basePrice + drift
+			highSpread = 0.3
+			lowSpread = 0.3
 		} else {
-			// Very tight range (low stddev → narrow Bollinger Bands).
+			// First half: very tight consolidation range.
 			price = basePrice + float64(i%3)*0.1 - float64(i%2)*0.05
 		}
 
@@ -77,6 +85,14 @@ func TestBollinger_BuysOnSqueezeBreakout(t *testing.T) {
 	_, upper, _, _ := CalculateBollingerBands(candles, 20, 2.0)
 	lastPrice := candles[len(candles)-1].Close
 	t.Logf("last price: %.2f, upper band: %.2f", lastPrice, upper)
+
+	// Verify ADX.
+	adx := CalculateADX(candles, 14)
+	t.Logf("ADX: %.2f (threshold: %.2f)", adx, s.MinADX)
+
+	// Verify RSI.
+	rsi := CalculateRSI(candles, 14)
+	t.Logf("RSI: %.2f (threshold: %.2f)", rsi, s.MinRSI)
 
 	if priorBW > s.SqueezeBandwidth {
 		t.Skipf("test data bandwidth %.4f > %.4f (no squeeze)", priorBW, s.SqueezeBandwidth)
@@ -147,18 +163,18 @@ func TestBollinger_SkipsWhenNoSqueeze(t *testing.T) {
 	}
 }
 
-func TestBollinger_ExitsBelowMiddleBand(t *testing.T) {
-	s := NewBollingerSqueezeStrategy(makeTestRiskConfig())
+func TestBollinger_ExitsOnATRStop(t *testing.T) {
+	s := NewBollingerSqueezeStrategy(config.RiskConfig{MaxRiskPerTradePct: 1.0})
 
-	// Create candles where price is below the middle band (SMA).
+	// Create candles that drop sharply below entry — triggers ATR trailing stop.
 	candles := make([]Candle, 50)
 	for i := 0; i < 50; i++ {
 		var price float64
 		if i < 35 {
 			price = 100 + float64(i)*0.5
 		} else {
-			// Drop below the SMA.
-			price = 100 + float64(35)*0.5 - float64(i-35)*3.0
+			// Sharp drop — well below entry.
+			price = 100 + float64(35)*0.5 - float64(i-35)*5.0
 		}
 		candles[i] = Candle{
 			Symbol: "TEST",
@@ -171,10 +187,14 @@ func TestBollinger_ExitsBelowMiddleBand(t *testing.T) {
 		}
 	}
 
-	middle, _, _, _ := CalculateBollingerBands(candles, 20, 2.0)
+	entryPrice := 120.0
 	lastPrice := candles[len(candles)-1].Close
-	if lastPrice >= middle {
-		t.Skipf("test data: price %.2f >= middle %.2f", lastPrice, middle)
+	atr := CalculateATR(candles, 14)
+	atrStop := entryPrice - (atr * s.ATRExitMultiplier)
+	t.Logf("entry=%.2f last=%.2f ATR=%.2f atrStop=%.2f", entryPrice, lastPrice, atr, atrStop)
+
+	if lastPrice >= atrStop {
+		t.Skipf("test data: price %.2f >= ATR stop %.2f — drop not sharp enough", lastPrice, atrStop)
 	}
 
 	input := StrategyInput{
@@ -186,7 +206,7 @@ func TestBollinger_ExitsBelowMiddleBand(t *testing.T) {
 		},
 		CurrentPosition: &PositionInfo{
 			Symbol:     "TEST",
-			EntryPrice: 120,
+			EntryPrice: entryPrice,
 			Quantity:   10,
 		},
 		Candles: candles,
@@ -194,7 +214,7 @@ func TestBollinger_ExitsBelowMiddleBand(t *testing.T) {
 
 	result := s.Evaluate(input)
 	if result.Action != ActionExit {
-		t.Errorf("expected EXIT below middle BB, got %s: %s", result.Action, result.Reason)
+		t.Errorf("expected EXIT on ATR stop, got %s: %s", result.Action, result.Reason)
 	}
 }
 

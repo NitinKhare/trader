@@ -266,3 +266,84 @@ type BacktestComparisonResponse struct {
 	BestBy     map[string]string           `json:"best_by"` // metric -> run_id
 	Timestamp  time.Time                   `json:"timestamp"`
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Portfolio & Regime Response Types
+// ────────────────────────────────────────────────────────────────────
+
+// RegimeResponse contains current market regime information
+type RegimeResponse struct {
+	AIRegime       string  `json:"ai_regime"`       // BULL/SIDEWAYS/BEAR
+	DetectedRegime string  `json:"detected_regime"`  // TRENDING/RANGING/HIGH_VOLATILITY/LOW_VOLATILITY
+	ADX            float64 `json:"adx"`
+	ATRPercentile  float64 `json:"atr_percentile"`
+	Volatility     float64 `json:"volatility"`
+	Confidence     float64 `json:"confidence"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+// StrategyAllocationItem represents a single strategy's allocation
+type StrategyAllocationItem struct {
+	StrategyID    string  `json:"strategy_id"`
+	StrategyType  string  `json:"strategy_type"`
+	CapitalPct    float64 `json:"capital_pct"`
+	Capital       float64 `json:"capital"`
+	RollingSharpe float64 `json:"rolling_sharpe"`
+	WinRate       float64 `json:"win_rate"`
+	TradeCount    int     `json:"trade_count"`
+}
+
+// StrategyAllocationResponse contains capital allocation per strategy
+type StrategyAllocationResponse struct {
+	Allocations []StrategyAllocationItem `json:"allocations"`
+	Mode        string                   `json:"mode"` // EQUAL or SHARPE_WEIGHTED
+	Timestamp   time.Time                `json:"timestamp"`
+}
+
+// ExtendedMetricsResponse contains all advanced metrics
+type ExtendedMetricsResponse struct {
+	// Basic metrics (from MetricsResponse)
+	TotalPnL        float64 `json:"total_pnl"`
+	WinRate         float64 `json:"win_rate"`
+	SharpeRatio     float64 `json:"sharpe_ratio"`
+	MaxDrawdown     float64 `json:"max_drawdown"`
+	ProfitFactor    float64 `json:"profit_factor"`
+	TotalTrades     int     `json:"total_trades"`
+
+	// Extended metrics
+	CAGR             float64 `json:"cagr"`
+	SortinoRatio     float64 `json:"sortino_ratio"`
+	CalmarRatio      float64 `json:"calmar_ratio"`
+	Expectancy       float64 `json:"expectancy"`
+	AvgRMultiple     float64 `json:"avg_r_multiple"`
+	PayoffRatio      float64 `json:"payoff_ratio"`
+	RecoveryFactor   float64 `json:"recovery_factor"`
+	MaxConsecutiveWins   int `json:"max_consecutive_wins"`
+	MaxConsecutiveLosses int `json:"max_consecutive_losses"`
+
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// StrategyPerformanceItem represents rolling metrics for one strategy
+type StrategyPerformanceItem struct {
+	StrategyID    string  `json:"strategy_id"`
+	TotalTrades   int     `json:"total_trades"`
+	WinRate       float64 `json:"win_rate"`
+	TotalPnL      float64 `json:"total_pnl"`
+	AvgPnL        float64 `json:"avg_pnl"`
+	RollingSharpe float64 `json:"rolling_sharpe"`
+	MaxDrawdown   float64 `json:"max_drawdown"`
+}
+
+// StrategyPerformanceResponse contains performance data per strategy
+type StrategyPerformanceResponse struct {
+	Strategies []StrategyPerformanceItem `json:"strategies"`
+	Timestamp  time.Time                 `json:"timestamp"`
+}
+
+// CorrelationResponse contains the correlation matrix
+type CorrelationResponse struct {
+	Symbols   []string    `json:"symbols"`
+	Matrix    [][]float64 `json:"matrix"`
+	Timestamp time.Time   `json:"timestamp"`
+}

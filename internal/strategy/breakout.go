@@ -65,8 +65,9 @@ func NewBreakoutStrategy(riskCfg config.RiskConfig) *BreakoutStrategy {
 	}
 }
 
-func (s *BreakoutStrategy) ID() string   { return "breakout_v1" }
-func (s *BreakoutStrategy) Name() string { return "Breakout Swing" }
+func (s *BreakoutStrategy) ID() string               { return "breakout_v1" }
+func (s *BreakoutStrategy) Name() string             { return "Breakout Swing" }
+func (s *BreakoutStrategy) GetStrategyType() StrategyType { return StrategyTypeBreakout }
 
 // Evaluate applies the breakout rules to produce a TradeIntent.
 func (s *BreakoutStrategy) Evaluate(input StrategyInput) TradeIntent {

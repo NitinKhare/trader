@@ -208,11 +208,11 @@ func TestLiveMode_MaxRiskPerTradeCap(t *testing.T) {
 
 func TestLiveMode_MaxCapitalDeploymentCap(t *testing.T) {
 	cfg := validLiveConfig()
-	cfg.Risk.MaxCapitalDeploymentPct = 90.0 // Exceeds live mode cap of 70%
+	cfg.Risk.MaxCapitalDeploymentPct = 110.0 // Exceeds live mode cap of 100%
 
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("expected validation error when max_capital_deployment_pct > 70 in live mode")
+		t.Fatal("expected validation error when max_capital_deployment_pct > 100 in live mode")
 	}
 	if !strings.Contains(err.Error(), "max_capital_deployment_pct") {
 		t.Errorf("error should mention max_capital_deployment_pct, got: %v", err)

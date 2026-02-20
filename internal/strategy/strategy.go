@@ -149,3 +149,25 @@ type Strategy interface {
 	// It must never produce side effects (no I/O, no state changes).
 	Evaluate(input StrategyInput) TradeIntent
 }
+
+// StrategyType classifies the kind of market behavior a strategy exploits.
+// Used by the regime-based strategy selector to filter strategies per market condition.
+type StrategyType string
+
+const (
+	StrategyTypeTrend         StrategyType = "TREND"
+	StrategyTypeMeanReversion StrategyType = "MEAN_REVERSION"
+	StrategyTypeBreakout      StrategyType = "BREAKOUT"
+	StrategyTypeMomentum      StrategyType = "MOMENTUM"
+	StrategyTypeVolatility    StrategyType = "VOLATILITY"
+)
+
+// ClassifiedStrategy extends Strategy with type classification.
+// Strategies that implement this interface can be filtered by the strategy selector
+// based on market regime. Strategies that don't implement this are treated as
+// applicable in all regimes (backward compatible).
+type ClassifiedStrategy interface {
+	Strategy
+	// GetStrategyType returns the classification of this strategy.
+	GetStrategyType() StrategyType
+}

@@ -91,21 +91,21 @@ func TestDhanData_ResolveSecurityID(t *testing.T) {
 func TestDhanData_FetchDailyCandles_SingleChunk(t *testing.T) {
 	// 30 days of data — fits in a single chunk.
 	now := time.Date(2026, 2, 8, 0, 0, 0, 0, IST)
-	timestamps := make([]int64, 20)
+	timestamps := make([]flexInt64, 20)
 	opens := make([]float64, 20)
 	highs := make([]float64, 20)
 	lows := make([]float64, 20)
 	closes := make([]float64, 20)
-	volumes := make([]int64, 20)
+	volumes := make([]flexInt64, 20)
 
 	for i := 0; i < 20; i++ {
 		d := now.AddDate(0, 0, -20+i)
-		timestamps[i] = d.Unix()
+		timestamps[i] = flexInt64(d.Unix())
 		opens[i] = 2500 + float64(i)
 		highs[i] = 2510 + float64(i)
 		lows[i] = 2490 + float64(i)
 		closes[i] = 2505 + float64(i)
-		volumes[i] = 1000000 + int64(i*10000)
+		volumes[i] = flexInt64(1000000 + int64(i*10000))
 	}
 
 	mockResp := dhanChartResponse{
@@ -145,8 +145,8 @@ func TestDhanData_FetchDailyCandles_MultipleChunks(t *testing.T) {
 			High:      []float64{105, 106, 107, 108, 109},
 			Low:       []float64{95, 96, 97, 98, 99},
 			Close:     []float64{102, 103, 104, 105, 106},
-			Volume:    []int64{10000, 10001, 10002, 10003, 10004},
-			Timestamp: []int64{now.Unix(), now.Unix() + 86400, now.Unix() + 86400*2, now.Unix() + 86400*3, now.Unix() + 86400*4},
+			Volume:    []flexInt64{10000, 10001, 10002, 10003, 10004},
+			Timestamp: []flexInt64{flexInt64(now.Unix()), flexInt64(now.Unix() + 86400), flexInt64(now.Unix() + 86400*2), flexInt64(now.Unix() + 86400*3), flexInt64(now.Unix() + 86400*4)},
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -178,8 +178,8 @@ func TestDhanData_FetchDailyCandles_365Days(t *testing.T) {
 		callCount++
 		resp := dhanChartResponse{
 			Open: []float64{100}, High: []float64{105}, Low: []float64{95},
-			Close: []float64{102}, Volume: []int64{10000},
-			Timestamp: []int64{time.Now().Unix()},
+			Close: []float64{102}, Volume: []flexInt64{10000},
+			Timestamp: []flexInt64{flexInt64(time.Now().Unix())},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -366,8 +366,8 @@ func TestDhanData_NIFTY50UsesIndexSegment(t *testing.T) {
 		json.NewDecoder(r.Body).Decode(&receivedReq)
 		resp := dhanChartResponse{
 			Open: []float64{22000}, High: []float64{22100}, Low: []float64{21900},
-			Close: []float64{22050}, Volume: []int64{0},
-			Timestamp: []int64{time.Now().Unix()},
+			Close: []float64{22050}, Volume: []flexInt64{0},
+			Timestamp: []flexInt64{flexInt64(time.Now().Unix())},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)

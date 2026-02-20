@@ -335,3 +335,173 @@ func AverageVolume(candles []Candle, period int) float64 {
 	}
 	return totalVol / float64(count)
 }
+
+// CalculateADX computes the Average Directional Index over the given period.
+// ADX measures trend strength regardless of direction (0-100).
+// ADX > 25 typically indicates a trending market; ADX < 20 indicates ranging.
+// Uses Wilder smoothing for +DI, -DI, and ADX.
+// Returns 0 if insufficient data (need at least 2*period+1 candles).
+func CalculateADX(candles []Candle, period int) float64 {
+	if len(candles) < 2*period+1 || period <= 0 {
+		return 0
+	}
+
+	n := len(candles)
+
+	// Step 1: Compute +DM, -DM, and TR for each bar.
+	plusDM := make([]float64, n)
+	minusDM := make([]float64, n)
+	tr := make([]float64, n)
+
+	for i := 1; i < n; i++ {
+		upMove := candles[i].High - candles[i-1].High
+		downMove := candles[i-1].Low - candles[i].Low
+
+		if upMove > downMove && upMove > 0 {
+			plusDM[i] = upMove
+		}
+		if downMove > upMove && downMove > 0 {
+			minusDM[i] = downMove
+		}
+
+		tr1 := candles[i].High - candles[i].Low
+		tr2 := math.Abs(candles[i].High - candles[i-1].Close)
+		tr3 := math.Abs(candles[i].Low - candles[i-1].Close)
+		tr[i] = math.Max(tr1, math.Max(tr2, tr3))
+	}
+
+	// Step 2: Wilder-smooth +DM, -DM, and TR over the period.
+	var smoothPlusDM, smoothMinusDM, smoothTR float64
+	for i := 1; i <= period; i++ {
+		smoothPlusDM += plusDM[i]
+		smoothMinusDM += minusDM[i]
+		smoothTR += tr[i]
+	}
+
+	if smoothTR == 0 {
+		return 0
+	}
+
+	// First +DI and -DI.
+	plusDI := 100 * smoothPlusDM / smoothTR
+	minusDI := 100 * smoothMinusDM / smoothTR
+
+	diSum := plusDI + minusDI
+	var dx float64
+	if diSum > 0 {
+		dx = 100 * math.Abs(plusDI-minusDI) / diSum
+	}
+
+	// Accumulate DX values for initial ADX seed.
+	adx := dx
+
+	// Step 3: Continue smoothing for remaining bars to build ADX.
+	for i := period + 1; i < n; i++ {
+		smoothPlusDM = smoothPlusDM - smoothPlusDM/float64(period) + plusDM[i]
+		smoothMinusDM = smoothMinusDM - smoothMinusDM/float64(period) + minusDM[i]
+		smoothTR = smoothTR - smoothTR/float64(period) + tr[i]
+
+		if smoothTR == 0 {
+			continue
+		}
+
+		plusDI = 100 * smoothPlusDM / smoothTR
+		minusDI = 100 * smoothMinusDM / smoothTR
+
+		diSum = plusDI + minusDI
+		if diSum > 0 {
+			dx = 100 * math.Abs(plusDI-minusDI) / diSum
+		} else {
+			dx = 0
+		}
+
+		// Wilder smooth the ADX.
+		adx = (adx*float64(period-1) + dx) / float64(period)
+	}
+
+	return adx
+}
+
+// CalculateATRPercentile returns where the current ATR sits relative to a
+// lookback window of historical ATR values. Returns 0-1 (1 = highest volatility in lookback).
+// atrPeriod is used to compute each ATR value; lookbackPeriod is the comparison window.
+// Returns 0 if insufficient data.
+func CalculateATRPercentile(candles []Candle, atrPeriod, lookbackPeriod int) float64 {
+	if len(candles) < atrPeriod+lookbackPeriod || atrPeriod <= 0 || lookbackPeriod <= 0 {
+		return 0
+	}
+
+	// Compute ATR for each point in the lookback window.
+	currentATR := CalculateATR(candles, atrPeriod)
+	if currentATR == 0 {
+		return 0
+	}
+
+	// Count how many historical ATR values are below the current one.
+	belowCount := 0
+	for offset := 0; offset < lookbackPeriod; offset++ {
+		end := len(candles) - offset
+		if end < atrPeriod+1 {
+			break
+		}
+		historicalATR := CalculateATR(candles[:end], atrPeriod)
+		if historicalATR < currentATR {
+			belowCount++
+		}
+	}
+
+	return float64(belowCount) / float64(lookbackPeriod)
+}
+
+// CalculateRollingVolatility computes the annualized standard deviation of
+// daily log returns over the given period. Used for volatility regime detection.
+// Returns 0 if insufficient data (need at least period+1 candles).
+func CalculateRollingVolatility(candles []Candle, period int) float64 {
+	if len(candles) < period+1 || period <= 0 {
+		return 0
+	}
+
+	// Compute log returns for the last `period` days.
+	start := len(candles) - period
+	logReturns := make([]float64, period)
+	for i := 0; i < period; i++ {
+		prev := candles[start+i-1].Close
+		curr := candles[start+i].Close
+		if prev <= 0 || curr <= 0 {
+			continue
+		}
+		logReturns[i] = math.Log(curr / prev)
+	}
+
+	// Compute mean.
+	var sum float64
+	for _, r := range logReturns {
+		sum += r
+	}
+	mean := sum / float64(period)
+
+	// Compute standard deviation.
+	var sumSqDiff float64
+	for _, r := range logReturns {
+		diff := r - mean
+		sumSqDiff += diff * diff
+	}
+	stddev := math.Sqrt(sumSqDiff / float64(period))
+
+	// Annualize (252 trading days).
+	return stddev * math.Sqrt(252)
+}
+
+// CalculateRollingReturn computes the simple return over the given period.
+// Returns (price_now - price_then) / price_then. Returns 0 if insufficient data.
+func CalculateRollingReturn(candles []Candle, period int) float64 {
+	if len(candles) < period+1 || period <= 0 {
+		return 0
+	}
+	current := candles[len(candles)-1].Close
+	past := candles[len(candles)-1-period].Close
+	if past == 0 {
+		return 0
+	}
+	return (current - past) / past
+}

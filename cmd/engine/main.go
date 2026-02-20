@@ -37,7 +37,10 @@ import (
 	"github.com/nitinkhare/algoTradingAgent/internal/analytics"
 	"github.com/nitinkhare/algoTradingAgent/internal/broker"
 	"github.com/nitinkhare/algoTradingAgent/internal/config"
+	"github.com/nitinkhare/algoTradingAgent/internal/features"
 	"github.com/nitinkhare/algoTradingAgent/internal/market"
+	"github.com/nitinkhare/algoTradingAgent/internal/portfolio"
+	"github.com/nitinkhare/algoTradingAgent/internal/regime"
 	"github.com/nitinkhare/algoTradingAgent/internal/risk"
 	"github.com/nitinkhare/algoTradingAgent/internal/scheduler"
 	"github.com/nitinkhare/algoTradingAgent/internal/storage"
@@ -49,6 +52,7 @@ func main() {
 	configPath := flag.String("config", "config/config.json", "path to configuration file")
 	mode := flag.String("mode", "status", "run mode: nightly | market | status | analytics | backtest | dry-run")
 	confirmLive := flag.Bool("confirm-live", false, "required safety flag to run in live trading mode")
+	yearsBack := flag.Int("years", 1, "years of historical data to fetch in nightly mode (default: 1)")
 	flag.Parse()
 
 	// Create logs directory if it doesn't exist
@@ -178,6 +182,30 @@ func main() {
 	}
 	logger.Printf("loaded %d strategies", len(strategies))
 
+	// Initialize regime detector and strategy selector.
+	regimeDetector := regime.NewDetector()
+	strategySelector := regime.NewStrategySelector()
+	logger.Println("regime detector and strategy selector initialized")
+
+	// Initialize centralized position sizer.
+	posSizer := risk.NewPositionSizer(risk.PositionSizerConfig{
+		ATRMultiplier:   cfg.PositionSizing.ATRMultiplier,
+		RiskPerTradePct: cfg.PositionSizing.RiskPerTradePct,
+		MaxPositionPct:  cfg.PositionSizing.MaxPositionPct,
+	})
+	logger.Println("position sizer initialized")
+
+	// Initialize portfolio components.
+	allocator := portfolio.NewAllocator(cfg.Capital, portfolio.AllocationEqual)
+	correlationEngine := portfolio.NewCorrelationEngine(0.75, 30)
+	perfMonitor := portfolio.NewPerformanceMonitor(30)
+	logger.Println("portfolio allocator, correlation engine, and performance monitor initialized")
+
+	// Initialize feature generator and signal scorer.
+	featureGen := features.NewGenerator()
+	signalScorer := features.NewSignalScorer()
+	logger.Println("feature generator and signal scorer initialized")
+
 	// Load sector map from stock universe for sector concentration checks.
 	sectorMap := loadSectorMap(logger, cfg.Paths.StockUniverseFile)
 
@@ -195,7 +223,7 @@ func main() {
 		runStatus(logger, cal, activeBroker, cfg)
 
 	case "nightly":
-		registerNightlyJobs(sched, cfg, logger)
+		registerNightlyJobs(sched, cfg, logger, *yearsBack)
 		ctx := context.Background()
 		if err := sched.RunNightlyJobs(ctx); err != nil {
 			logger.Fatalf("nightly jobs failed: %v", err)
@@ -223,7 +251,8 @@ func main() {
 			}
 		}
 
-		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, tc, sectorMap, cb, &wg, logger)
+		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, tc, sectorMap, cb, &wg, logger,
+			regimeDetector, strategySelector, posSizer, allocator, correlationEngine, perfMonitor, featureGen, signalScorer)
 
 		// Set up context with signal handling for graceful shutdown.
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -262,7 +291,8 @@ func main() {
 		runAnalytics(store, cfg, logger)
 
 	case "backtest":
-		runBacktest(cfg, strategies, riskMgr, sectorMap, logger)
+		runBacktest(cfg, strategies, riskMgr, sectorMap, logger,
+			regimeDetector, strategySelector, posSizer, featureGen, signalScorer, perfMonitor)
 
 	case "dry-run":
 		if err := runDryRun(cfg, strategies, riskMgr, sectorMap, logger); err != nil {
@@ -300,7 +330,7 @@ func runStatus(logger *log.Logger, cal *market.Calendar, b broker.Broker, cfg *c
 }
 
 // registerNightlyJobs sets up all nightly scheduled jobs.
-func registerNightlyJobs(sched *scheduler.Scheduler, cfg *config.Config, logger *log.Logger) {
+func registerNightlyJobs(sched *scheduler.Scheduler, cfg *config.Config, logger *log.Logger, yearsBack int) {
 	// Job 0: Sync market data from Dhan API.
 	// This runs BEFORE AI scoring so that fresh candles are available.
 	sched.RegisterJob(scheduler.Job{
@@ -341,9 +371,9 @@ func registerNightlyJobs(sched *scheduler.Scheduler, cfg *config.Config, logger 
 			// Add NIFTY50 for regime detection.
 			symbols := append(universe.Symbols, "NIFTY50")
 
-			// Fetch 1 year of history and export as CSVs for Python.
+			// Fetch historical data and export as CSVs for Python.
 			today := time.Now().In(market.IST)
-			from := today.AddDate(-1, 0, 0)
+			from := today.AddDate(-yearsBack, 0, 0)
 
 			successCount := 0
 			failCount := 0
@@ -452,6 +482,14 @@ func registerMarketJobs(
 	cb *risk.CircuitBreaker,
 	wg *sync.WaitGroup,
 	logger *log.Logger,
+	regimeDetector *regime.Detector,
+	strategySelector *regime.StrategySelector,
+	posSizer *risk.PositionSizer,
+	allocator *portfolio.Allocator,
+	correlationEngine *portfolio.CorrelationEngine,
+	perfMonitor *portfolio.PerformanceMonitor,
+	featureGen *features.Generator,
+	signalScorer *features.SignalScorer,
 ) {
 	// Job: Execute pre-planned trades from watchlist.
 	sched.RegisterJob(scheduler.Job{
@@ -566,15 +604,70 @@ func registerMarketJobs(
 			// Calculate daily PnL from DB (realized) and holdings (unrealized).
 			dailyPnL := calculateDailyPnL(ctx, store, tc, holdings, logger)
 
+			// ── Regime detection: detect OHLCV-based market regime using NIFTY50 data ──
+			niftyCSV := filepath.Join(cfg.Paths.MarketDataDir, "NIFTY50.csv")
+			niftyCandles := market.LoadExistingCSV(niftyCSV)
+			detectedRegime := regimeDetector.Detect(niftyCandles)
+			logger.Printf("detected regime: %s (AI: %s)", detectedRegime.Primary, regime.Regime)
+
+			// ── Strategy filtering: select strategies allowed for the current regime ──
+			activeStrategies := strategySelector.SelectStrategies(detectedRegime, regime, strategies)
+			if len(activeStrategies) == 0 {
+				activeStrategies = strategies // fallback: use all strategies if none match regime
+			}
+			logger.Printf("active strategies after regime filter: %d/%d", len(activeStrategies), len(strategies))
+
+			// ── Preload candle data for correlation engine ──
+			candleCache := make(map[string][]strategy.Candle)
+			for _, score := range scores {
+				csvPath := filepath.Join(cfg.Paths.MarketDataDir, score.Symbol+".csv")
+				candles := market.LoadExistingCSV(csvPath)
+				if len(candles) > 0 {
+					candleCache[score.Symbol] = candles
+				}
+			}
+
+			// ── Compute correlation matrix across held + candidate symbols ──
+			corrMatrix := correlationEngine.ComputeCorrelation(candleCache)
+
+			// ── Update allocator capital from live balance ──
+			allocator.UpdateCapital(funds.TotalBalance)
+
 			// Core loop: iterate scored stocks, run strategies, validate, execute.
 			buyCount := 0
 			skipCount := 0
 			for _, score := range scores {
-				// Load candle history for this symbol.
-				csvPath := filepath.Join(cfg.Paths.MarketDataDir, score.Symbol+".csv")
-				candles := market.LoadExistingCSV(csvPath)
-				if len(candles) == 0 {
+				// Load candle history for this symbol (from cache).
+				candles, ok := candleCache[score.Symbol]
+				if !ok || len(candles) == 0 {
 					logger.Printf("  %s: SKIP (no candle data)", score.Symbol)
+					skipCount++
+					continue
+				}
+
+				// ── Feature scoring: generate feature vector and score ──
+				fv := featureGen.Generate(candles)
+				if fv == nil {
+					logger.Printf("  %s: SKIP (insufficient candle history for features)", score.Symbol)
+					skipCount++
+					continue
+				}
+				signalScore := signalScorer.Score(fv)
+				if signalScore < cfg.SignalScoreThreshold {
+					logger.Printf("  %s: SKIP (signal score %.2f < %.2f threshold)", score.Symbol, signalScore, cfg.SignalScoreThreshold)
+					skipCount++
+					continue
+				}
+
+				// ── Correlation check: skip if highly correlated with existing positions ──
+				existingSymbols := make([]string, 0, len(holdingsMap))
+				for sym := range holdingsMap {
+					existingSymbols = append(existingSymbols, sym)
+				}
+				if reduce, corrWith, corrVal := correlationEngine.ShouldReduceAllocation(
+					score.Symbol, existingSymbols, corrMatrix,
+				); reduce {
+					logger.Printf("  %s: SKIP (high correlation %.2f with %s)", score.Symbol, corrVal, corrWith)
 					skipCount++
 					continue
 				}
@@ -597,8 +690,8 @@ func registerMarketJobs(
 					AvailableCapital:  availableCapital,
 				}
 
-				// Run each strategy.
-				for _, strat := range strategies {
+				// Run each regime-filtered strategy.
+				for _, strat := range activeStrategies {
 					intent := strat.Evaluate(input)
 
 					switch intent.Action {
@@ -610,6 +703,15 @@ func registerMarketJobs(
 						logger.Printf("  %s [%s]: HOLD — %s", score.Symbol, strat.ID(), intent.Reason)
 
 					case strategy.ActionBuy:
+						// ── Centralized position sizing: override quantity/stop from ATR-based sizer ──
+						sized := posSizer.Size(funds.TotalBalance, intent.Price, candles)
+						if sized.Quantity > 0 {
+							intent.Quantity = sized.Quantity
+							intent.StopLoss = sized.StopLoss
+							logger.Printf("  %s [%s]: position sized: qty=%d stop=%.2f (ATR-based)",
+								score.Symbol, strat.ID(), sized.Quantity, sized.StopLoss)
+						}
+
 						// Validate through risk manager.
 						result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital, sectorMap)
 						if !result.Approved {
@@ -2215,6 +2317,12 @@ func runBacktest(
 	riskMgr *risk.Manager,
 	sectorMap map[string]string,
 	logger *log.Logger,
+	regimeDetector *regime.Detector,
+	strategySelector *regime.StrategySelector,
+	posSizer *risk.PositionSizer,
+	featureGen *features.Generator,
+	signalScorer *features.SignalScorer,
+	perfMonitor *portfolio.PerformanceMonitor,
 ) {
 	logger.Println("[backtest] starting backtest run...")
 
@@ -2321,6 +2429,23 @@ func runBacktest(
 
 		dailyPnL := risk.DailyPnL{Date: date}
 
+		// ── Regime detection for backtest: use NIFTY50 candles up to this date ──
+		niftyCSV := filepath.Join(cfg.Paths.MarketDataDir, "NIFTY50.csv")
+		niftyCandles := market.LoadExistingCSV(niftyCSV)
+		var niftyUpToDate []strategy.Candle
+		for _, c := range niftyCandles {
+			if !c.Date.After(date) {
+				niftyUpToDate = append(niftyUpToDate, c)
+			}
+		}
+		detectedRegime := regimeDetector.Detect(niftyUpToDate)
+
+		// ── Strategy filtering for backtest ──
+		activeStrategies := strategySelector.SelectStrategies(detectedRegime, regime, strategies)
+		if len(activeStrategies) == 0 {
+			activeStrategies = strategies // fallback: use all strategies if none match regime
+		}
+
 		for _, score := range scores {
 			// Load candle data.
 			csvPath := filepath.Join(cfg.Paths.MarketDataDir, score.Symbol+".csv")
@@ -2338,6 +2463,16 @@ func runBacktest(
 			}
 			if len(candlesUpToDate) == 0 {
 				continue
+			}
+
+			// ── Feature scoring in backtest ──
+			fv := featureGen.Generate(candlesUpToDate)
+			if fv == nil {
+				continue // skip stocks with insufficient candle history
+			}
+			signalScore := signalScorer.Score(fv)
+			if signalScore < cfg.SignalScoreThreshold {
+				continue // skip low-confidence signals
 			}
 
 			// Check existing position.
@@ -2365,7 +2500,7 @@ func runBacktest(
 				AvailableCapital:  availableCapital,
 			}
 
-			for _, strat := range strategies {
+			for _, strat := range activeStrategies {
 				intent := strat.Evaluate(input)
 
 				switch intent.Action {
@@ -2373,6 +2508,14 @@ func runBacktest(
 					if _, alreadyHeld := positions[intent.Symbol]; alreadyHeld {
 						continue
 					}
+
+					// ── Centralized position sizing in backtest ──
+					sized := posSizer.Size(capital, intent.Price, candlesUpToDate)
+					if sized.Quantity > 0 {
+						intent.Quantity = sized.Quantity
+						intent.StopLoss = sized.StopLoss
+					}
+
 					result := riskMgr.Validate(intent, openPositions, dailyPnL, availableCapital, sectorMap)
 					if !result.Approved {
 						continue
@@ -2558,4 +2701,33 @@ func runBacktest(
 
 	report := analytics.Analyze(closedTrades, cfg.Capital)
 	fmt.Println(analytics.FormatReport(report))
+
+	// ── Extended metrics from new analytics module ──
+	if len(closedTrades) > 0 && len(dates) >= 2 {
+		startDate, _ := time.Parse("2006-01-02", dates[0])
+		endDate, _ := time.Parse("2006-01-02", dates[len(dates)-1])
+		extended := analytics.AnalyzeExtended(closedTrades, cfg.Capital, startDate, endDate)
+		if extended != nil {
+			logger.Println("[backtest] === Extended Metrics ===")
+			logger.Printf("  CAGR:                  %.2f%%", extended.CAGR*100)
+			logger.Printf("  Sortino Ratio:         %.2f", extended.SortinoRatio)
+			logger.Printf("  Calmar Ratio:          %.2f", extended.CalmarRatio)
+			logger.Printf("  Expectancy:            ₹%.2f", extended.Expectancy)
+			logger.Printf("  Avg R-Multiple:        %.2f", extended.AvgRMultiple)
+			logger.Printf("  Payoff Ratio:          %.2f", extended.PayoffRatio)
+			logger.Printf("  Recovery Factor:       %.2f", extended.RecoveryFactor)
+			logger.Printf("  Max Consecutive Wins:  %d", extended.MaxConsecutiveWins)
+			logger.Printf("  Max Consecutive Losses:%d", extended.MaxConsecutiveLosses)
+		}
+	}
+
+	// ── Per-strategy performance breakdown via performance monitor ──
+	snapshots := perfMonitor.Update(closedTrades)
+	if len(snapshots) > 0 {
+		logger.Println("[backtest] === Strategy Performance ===")
+		for stratID, snap := range snapshots {
+			logger.Printf("  %-25s trades=%-4d sharpe=%.2f win_rate=%.1f%%",
+				stratID, snap.TradeCount, snap.RollingSharpe, snap.RecentWinRate)
+		}
+	}
 }

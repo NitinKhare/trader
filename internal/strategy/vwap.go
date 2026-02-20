@@ -53,9 +53,9 @@ func NewVWAPReversionStrategy(riskCfg config.RiskConfig) *VWAPReversionStrategy 
 	return &VWAPReversionStrategy{
 		VWAPDeviationPct:       2.0,
 		RSIOversoldThreshold:   40,
-		MaxVolatility:          0.7,
+		MaxVolatility:          0.85, // was 0.70 — all stocks show volatility > 0.70; VWAP works at moderate vol
 		MinLiquidity:           0.5,
-		MaxRiskScore:           0.5,
+		MaxRiskScore:           0.55, // was 0.50 — slightly wider to match current score distribution
 		VWAPLookback:           20,
 		VWAPOvershootPct:       1.5,
 		RSIOverboughtThreshold: 65,
@@ -64,8 +64,9 @@ func NewVWAPReversionStrategy(riskCfg config.RiskConfig) *VWAPReversionStrategy 
 	}
 }
 
-func (s *VWAPReversionStrategy) ID() string   { return "vwap_reversion_v1" }
-func (s *VWAPReversionStrategy) Name() string { return "VWAP Reversion" }
+func (s *VWAPReversionStrategy) ID() string               { return "vwap_reversion_v1" }
+func (s *VWAPReversionStrategy) Name() string             { return "VWAP Reversion" }
+func (s *VWAPReversionStrategy) GetStrategyType() StrategyType { return StrategyTypeMeanReversion }
 
 // Evaluate applies the VWAP reversion rules to produce a TradeIntent.
 func (s *VWAPReversionStrategy) Evaluate(input StrategyInput) TradeIntent {

@@ -72,7 +72,10 @@ def main():
                         help="Path to stock universe JSON file")
     args = parser.parse_args()
 
-    scoring_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    if args.date.lower() == "today":
+        scoring_date = date.today()
+    else:
+        scoring_date = datetime.strptime(args.date, "%Y-%m-%d").date()
     print(f"=== AI Scoring Pipeline: {scoring_date} ===")
 
     # Step 1: Load stock universe.

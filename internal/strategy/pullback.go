@@ -71,8 +71,9 @@ func NewPullbackStrategy(riskCfg config.RiskConfig) *PullbackStrategy {
 	}
 }
 
-func (s *PullbackStrategy) ID() string   { return "pullback_v1" }
-func (s *PullbackStrategy) Name() string { return "EMA Pullback" }
+func (s *PullbackStrategy) ID() string               { return "pullback_v1" }
+func (s *PullbackStrategy) Name() string             { return "EMA Pullback" }
+func (s *PullbackStrategy) GetStrategyType() StrategyType { return StrategyTypeTrend }
 
 // Evaluate applies the pullback rules to produce a TradeIntent.
 func (s *PullbackStrategy) Evaluate(input StrategyInput) TradeIntent {
