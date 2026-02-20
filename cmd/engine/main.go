@@ -84,7 +84,7 @@ func main() {
 	// ── Live mode safety gate ──
 	// Both --confirm-live flag AND ALGO_LIVE_CONFIRMED=true env var are
 	// required to start in live mode. This prevents accidental live trading.
-	if cfg.TradingMode == config.ModeLive {
+	if cfg.TradingMode == config.ModeLive && *mode == "market" {
 		envConfirmed := os.Getenv("ALGO_LIVE_CONFIRMED") == "true"
 		if !*confirmLive || !envConfirmed {
 			fmt.Fprintln(os.Stderr, "")
