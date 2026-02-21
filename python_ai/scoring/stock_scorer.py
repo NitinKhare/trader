@@ -134,13 +134,13 @@ def score_volatility(features: pd.Series) -> float:
     # ATR as percentage of price.
     atr_pct = features["atr_14"] / features["close"]
 
-    # Sweet spot: 1-3% daily range for swing trading.
-    if 0.01 <= atr_pct <= 0.03:
-        return 0.8 + (0.2 * (1 - abs(atr_pct - 0.02) / 0.01))
+    # Sweet spot: 1-5% daily range (wider to accommodate penny stocks).
+    if 0.01 <= atr_pct <= 0.05:
+        return 0.8 + (0.2 * (1 - abs(atr_pct - 0.03) / 0.02))
     elif atr_pct < 0.01:
         return max(0.3, atr_pct / 0.01)  # Too quiet.
     else:
-        return max(0.1, 1.0 - (atr_pct - 0.03) / 0.05)  # Too volatile.
+        return max(0.1, 1.0 - (atr_pct - 0.05) / 0.07)  # Too volatile.
 
 
 def score_risk(features: pd.Series) -> float:
@@ -159,12 +159,12 @@ def score_risk(features: pd.Series) -> float:
         elif rsi < 20:
             risk += 0.2  # Oversold (risky for longs).
 
-    # High ATR relative to price = higher risk.
+    # High ATR relative to price = higher risk (thresholds widened for penny stocks).
     if pd.notna(features.get("atr_14")) and features["close"] > 0:
         atr_pct = features["atr_14"] / features["close"]
-        if atr_pct > 0.04:
+        if atr_pct > 0.06:
             risk += 0.3
-        elif atr_pct > 0.03:
+        elif atr_pct > 0.04:
             risk += 0.15
 
     # Price below 200 SMA = higher risk.

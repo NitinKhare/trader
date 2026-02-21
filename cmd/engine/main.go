@@ -2309,6 +2309,92 @@ type backtestPosition struct {
 	entryDate  time.Time
 }
 
+// ── Backtest results dump structs ──
+
+// BacktestResults is the top-level struct written to the JSON results file.
+type BacktestResults struct {
+	RunTimestamp    string                `json:"run_timestamp"`
+	StartDate       string                `json:"start_date"`
+	EndDate         string                `json:"end_date"`
+	StartingCapital float64               `json:"starting_capital"`
+	FinalCapital    float64               `json:"final_capital"`
+	TotalPnL        float64               `json:"total_pnl"`
+	TotalPnLPct     float64               `json:"total_pnl_pct"`
+	MaxCapitalUsed  float64               `json:"max_capital_used"`
+	Summary         BacktestSummary       `json:"summary"`
+	Extended        BacktestExtended      `json:"extended_metrics"`
+	StrategyPerf    []BacktestStratPerf   `json:"strategy_performance"`
+	Trades          []BacktestTrade       `json:"trades"`
+	EquityCurve     []BacktestEquityPoint `json:"equity_curve"`
+}
+
+// BacktestSummary mirrors analytics.PerformanceReport for JSON output.
+type BacktestSummary struct {
+	TotalTrades   int     `json:"total_trades"`
+	WinningTrades int     `json:"winning_trades"`
+	LosingTrades  int     `json:"losing_trades"`
+	WinRate       float64 `json:"win_rate"`
+	GrossProfit   float64 `json:"gross_profit"`
+	GrossLoss     float64 `json:"gross_loss"`
+	ProfitFactor  float64 `json:"profit_factor"`
+	SharpeRatio   float64 `json:"sharpe_ratio"`
+	MaxDrawdown   float64 `json:"max_drawdown"`
+	MaxDrawdownPct float64 `json:"max_drawdown_pct"`
+	AvgHoldDays   float64 `json:"avg_hold_days"`
+	MinHoldDays   int     `json:"min_hold_days"`
+	MaxHoldDays   int     `json:"max_hold_days"`
+}
+
+// BacktestExtended mirrors analytics.ExtendedMetrics for JSON output.
+type BacktestExtended struct {
+	CAGR                 float64 `json:"cagr"`
+	SortinoRatio         float64 `json:"sortino_ratio"`
+	CalmarRatio          float64 `json:"calmar_ratio"`
+	Expectancy           float64 `json:"expectancy"`
+	AvgRMultiple         float64 `json:"avg_r_multiple"`
+	PayoffRatio          float64 `json:"payoff_ratio"`
+	RecoveryFactor       float64 `json:"recovery_factor"`
+	MaxConsecutiveWins   int     `json:"max_consecutive_wins"`
+	MaxConsecutiveLosses int     `json:"max_consecutive_losses"`
+}
+
+// BacktestStratPerf captures per-strategy metrics.
+type BacktestStratPerf struct {
+	Strategy    string  `json:"strategy"`
+	Trades      int     `json:"trades"`
+	WinRate     float64 `json:"win_rate"`
+	TotalPnL    float64 `json:"total_pnl"`
+	AvgPnL      float64 `json:"avg_pnl"`
+	Sharpe      float64 `json:"sharpe"`
+	AvgHoldDays float64 `json:"avg_hold_days"`
+}
+
+// BacktestTrade captures a single closed trade with full detail.
+type BacktestTrade struct {
+	TradeNo    int     `json:"trade_no"`
+	Symbol     string  `json:"symbol"`
+	Strategy   string  `json:"strategy"`
+	Side       string  `json:"side"`
+	Quantity   int     `json:"quantity"`
+	EntryPrice float64 `json:"entry_price"`
+	ExitPrice  float64 `json:"exit_price"`
+	StopLoss   float64 `json:"stop_loss"`
+	Target     float64 `json:"target"`
+	EntryDate  string  `json:"entry_date"`
+	ExitDate   string  `json:"exit_date"`
+	ExitReason string  `json:"exit_reason"`
+	PnL        float64 `json:"pnl"`
+	PnLPct     float64 `json:"pnl_pct"`
+	HoldDays   int     `json:"hold_days"`
+}
+
+// BacktestEquityPoint represents one point on the equity curve.
+type BacktestEquityPoint struct {
+	Date     string  `json:"date"`
+	Equity   float64 `json:"equity"`
+	Drawdown float64 `json:"drawdown"`
+}
+
 // runBacktest runs strategies against historical data to validate before going live.
 // It iterates day-by-day through available AI outputs and market data.
 func runBacktest(
@@ -2728,6 +2814,145 @@ func runBacktest(
 		for stratID, snap := range snapshots {
 			logger.Printf("  %-25s trades=%-4d sharpe=%.2f win_rate=%.1f%%",
 				stratID, snap.TradeCount, snap.RollingSharpe, snap.RecentWinRate)
+		}
+	}
+
+	// ── Export backtest results to JSON file ──
+	results := BacktestResults{
+		RunTimestamp:    time.Now().Format(time.RFC3339),
+		StartingCapital: cfg.Capital,
+		FinalCapital:    finalCapital,
+		TotalPnL:        finalCapital - cfg.Capital,
+		TotalPnLPct:     ((finalCapital - cfg.Capital) / cfg.Capital) * 100,
+		MaxCapitalUsed:  maxCapitalUsed,
+	}
+
+	if len(dates) > 0 {
+		results.StartDate = dates[0]
+		results.EndDate = dates[len(dates)-1]
+	}
+
+	// Summary from analytics report.
+	if report != nil {
+		results.Summary = BacktestSummary{
+			TotalTrades:    report.TotalTrades,
+			WinningTrades:  report.WinningTrades,
+			LosingTrades:   report.LosingTrades,
+			WinRate:        report.WinRate,
+			GrossProfit:    report.GrossProfit,
+			GrossLoss:      report.GrossLoss,
+			ProfitFactor:   report.ProfitFactor,
+			SharpeRatio:    report.SharpeRatio,
+			MaxDrawdown:    report.MaxDrawdown,
+			MaxDrawdownPct: report.MaxDrawdownPct,
+			AvgHoldDays:    report.AverageHoldDays,
+			MinHoldDays:    report.MinHoldDays,
+			MaxHoldDays:    report.MaxHoldDays,
+		}
+	}
+
+	// Extended metrics.
+	if len(closedTrades) > 0 && len(dates) >= 2 {
+		startDate, _ := time.Parse("2006-01-02", dates[0])
+		endDate, _ := time.Parse("2006-01-02", dates[len(dates)-1])
+		ext := analytics.AnalyzeExtended(closedTrades, cfg.Capital, startDate, endDate)
+		if ext != nil {
+			results.Extended = BacktestExtended{
+				CAGR:                 ext.CAGR * 100,
+				SortinoRatio:         ext.SortinoRatio,
+				CalmarRatio:          ext.CalmarRatio,
+				Expectancy:           ext.Expectancy,
+				AvgRMultiple:         ext.AvgRMultiple,
+				PayoffRatio:          ext.PayoffRatio,
+				RecoveryFactor:       ext.RecoveryFactor,
+				MaxConsecutiveWins:   ext.MaxConsecutiveWins,
+				MaxConsecutiveLosses: ext.MaxConsecutiveLosses,
+			}
+		}
+	}
+
+	// Per-strategy performance.
+	if report != nil {
+		for stratID, sr := range report.StrategyReports {
+			sp := BacktestStratPerf{
+				Strategy:    stratID,
+				Trades:      sr.TotalTrades,
+				WinRate:     sr.WinRate,
+				TotalPnL:    sr.TotalPnL,
+				AvgPnL:      sr.AveragePnL,
+				AvgHoldDays: sr.AverageHoldDays,
+			}
+			// Pull Sharpe from performance monitor if available.
+			if snap, ok := snapshots[stratID]; ok {
+				sp.Sharpe = snap.RollingSharpe
+			}
+			results.StrategyPerf = append(results.StrategyPerf, sp)
+		}
+	}
+
+	// Individual trades.
+	for i, t := range closedTrades {
+		exitDate := ""
+		if t.ExitTime != nil {
+			exitDate = t.ExitTime.Format("2006-01-02")
+		}
+		entryValue := t.EntryPrice * float64(t.Quantity)
+		pnlPct := 0.0
+		if entryValue > 0 {
+			pnlPct = (t.PnL / entryValue) * 100
+		}
+		holdDays := 0
+		if t.ExitTime != nil {
+			holdDays = int(t.ExitTime.Sub(t.EntryTime).Hours() / 24)
+			if holdDays < 0 {
+				holdDays = 0
+			}
+		}
+		results.Trades = append(results.Trades, BacktestTrade{
+			TradeNo:    i + 1,
+			Symbol:     t.Symbol,
+			Strategy:   t.StrategyID,
+			Side:       t.Side,
+			Quantity:   t.Quantity,
+			EntryPrice: t.EntryPrice,
+			ExitPrice:  t.ExitPrice,
+			StopLoss:   t.StopLoss,
+			Target:     t.Target,
+			EntryDate:  t.EntryTime.Format("2006-01-02"),
+			ExitDate:   exitDate,
+			ExitReason: t.ExitReason,
+			PnL:        t.PnL,
+			PnLPct:     pnlPct,
+			HoldDays:   holdDays,
+		})
+	}
+
+	// Equity curve.
+	eqCurve := analytics.EquityCurve(closedTrades, cfg.Capital)
+	for _, pt := range eqCurve {
+		results.EquityCurve = append(results.EquityCurve, BacktestEquityPoint{
+			Date:     pt.Date.Format("2006-01-02"),
+			Equity:   pt.Equity,
+			Drawdown: pt.Drawdown,
+		})
+	}
+
+	// Write JSON file.
+	resultsJSON, err := json.MarshalIndent(results, "", "  ")
+	if err != nil {
+		logger.Printf("[backtest] WARNING: failed to marshal results: %v", err)
+	} else {
+		resultsFilename := fmt.Sprintf("backtest_results_%s.json",
+			time.Now().Format("2006-01-02_150405"))
+		resultsPath := filepath.Join(cfg.Paths.LogDir, resultsFilename)
+
+		if writeErr := os.MkdirAll(cfg.Paths.LogDir, 0o755); writeErr != nil {
+			logger.Printf("[backtest] WARNING: cannot create log dir: %v", writeErr)
+		} else if writeErr := os.WriteFile(resultsPath, resultsJSON, 0o644); writeErr != nil {
+			logger.Printf("[backtest] WARNING: failed to write results file: %v", writeErr)
+		} else {
+			logger.Printf("[backtest] results saved to %s (%d trades, %d equity points)",
+				resultsPath, len(results.Trades), len(results.EquityCurve))
 		}
 	}
 }

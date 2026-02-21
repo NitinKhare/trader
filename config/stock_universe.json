@@ -1,5 +1,5 @@
 {
-  "description": "NIFTY 50 + High-volume Mid-cap stocks",
+  "description": "NIFTY 50 + High-volume Mid-cap + Penny stocks",
   "updated": "2026-02-13",
   "stocks": [
     {"symbol": "RELIANCE", "sector": "OIL_GAS"},
@@ -65,7 +65,13 @@
     {"symbol": "HAL", "sector": "DEFENCE"},
     {"symbol": "GODREJCP", "sector": "CONSUMER"},
     {"symbol": "CASTROLIND", "sector": "LUBRICANTS"},
-    {"symbol": "ZYDUSLIFE", "sector": "PHARMA"}
+    {"symbol": "ZYDUSLIFE", "sector": "PHARMA"},
+    {"symbol": "SUZLON", "sector": "ENERGY"},
+    {"symbol": "YESBANK", "sector": "BANKING"},
+    {"symbol": "IOB", "sector": "BANKING"},
+    {"symbol": "TRIDENT", "sector": "TEXTILE"},
+    {"symbol": "JPPOWER", "sector": "POWER"},
+    {"symbol": "CENTRALBK", "sector": "BANKING"}
   ],
   "symbols": [
     "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "HINDUNILVR", "ITC", "SBIN",
@@ -76,6 +82,7 @@
     "BPCL", "EICHERMOT", "GRASIM", "DIVISLAB", "BRITANNIA", "APOLLOHOSP", "SBILIFE",
     "TATACONSUM", "HEROMOTOCO", "ADANIPORTS", "BAJAJ-AUTO", "LTIM", "HDFCLIFE", "VEDL",
     "PFC", "LUPIN", "UPL", "IDEA", "CUMMINSIND", "OFSS", "SIEMENS",
-    "GRINDWELL", "JTEKTINDIA", "BEL", "HAL", "GODREJCP", "CASTROLIND", "ZYDUSLIFE"
+    "GRINDWELL", "JTEKTINDIA", "BEL", "HAL", "GODREJCP", "CASTROLIND", "ZYDUSLIFE",
+    "SUZLON", "YESBANK", "IOB", "TRIDENT", "JPPOWER", "CENTRALBK"
   ]
 }
