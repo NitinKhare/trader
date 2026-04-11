@@ -39,6 +39,7 @@ import (
 	"github.com/nitinkhare/algoTradingAgent/internal/config"
 	"github.com/nitinkhare/algoTradingAgent/internal/features"
 	"github.com/nitinkhare/algoTradingAgent/internal/market"
+	"github.com/nitinkhare/algoTradingAgent/internal/notify"
 	"github.com/nitinkhare/algoTradingAgent/internal/portfolio"
 	"github.com/nitinkhare/algoTradingAgent/internal/regime"
 	"github.com/nitinkhare/algoTradingAgent/internal/risk"
@@ -80,6 +81,13 @@ func main() {
 		logger.Fatalf("failed to load config: %v", err)
 	}
 	logger.Printf("config loaded: broker=%s mode=%s capital=%.2f", cfg.ActiveBroker, cfg.TradingMode, cfg.Capital)
+
+	// ── Telegram notifier ──
+	var tg *notify.Telegram
+	if cfg.Telegram.Enabled {
+		tg = notify.NewTelegram(cfg.Telegram.BotToken, cfg.Telegram.ChatID, logger)
+		logger.Printf("telegram notifications enabled (chat_id=%s)", cfg.Telegram.ChatID)
+	}
 
 	// ── Live mode safety gate ──
 	// Both --confirm-live flag AND ALGO_LIVE_CONFIRMED=true env var are
@@ -244,7 +252,7 @@ func main() {
 			whServer = webhook.NewServer(whCfg, logger)
 
 			// Register postback-driven position update handler.
-			registerPostbackHandler(whServer, activeBroker, store, tc, cb, cfg, logger)
+			registerPostbackHandler(whServer, activeBroker, store, tc, cb, cfg, logger, tg)
 
 			if err := whServer.Start(); err != nil {
 				logger.Fatalf("failed to start webhook server: %v", err)
@@ -252,7 +260,7 @@ func main() {
 		}
 
 		registerMarketJobs(sched, cfg, activeBroker, strategies, riskMgr, store, tc, sectorMap, cb, &wg, logger,
-			regimeDetector, strategySelector, posSizer, allocator, correlationEngine, perfMonitor, featureGen, signalScorer)
+			regimeDetector, strategySelector, posSizer, allocator, correlationEngine, perfMonitor, featureGen, signalScorer, tg)
 
 		// Set up context with signal handling for graceful shutdown.
 		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -490,6 +498,7 @@ func registerMarketJobs(
 	perfMonitor *portfolio.PerformanceMonitor,
 	featureGen *features.Generator,
 	signalScorer *features.SignalScorer,
+	tg *notify.Telegram,
 ) {
 	// Job: Execute pre-planned trades from watchlist.
 	sched.RegisterJob(scheduler.Job{
@@ -783,6 +792,9 @@ func registerMarketJobs(
 
 						// Order FILLED — save trade and place stop-loss order.
 						logger.Printf("  %s: order %s FILLED avg=%.2f", score.Symbol, resp.OrderID, finalStatus.AveragePrice)
+						if tg != nil {
+							tg.NotifyBuy(score.Symbol, strat.ID(), intent.Quantity, finalStatus.AveragePrice, intent.StopLoss, intent.Target, resp.OrderID)
+						}
 						tradeID := saveTradeRecord(ctx, store, logger, intent, resp.OrderID)
 
 						// Update tradeContext so SL order ID can be tracked.
@@ -869,6 +881,14 @@ func registerMarketJobs(
 						logTradeAction(ctx, store, logger, "EXIT_PLACED", "ORDER_PLACED",
 							fmt.Sprintf("order=%s qty=%d price=%.2f reason=%s", resp.OrderID, intent.Quantity, intent.Price, intent.Reason),
 							intent, string(regime.Regime))
+
+						if tg != nil {
+							entryPrice := intent.Price // best available; actual fill used when confirmed
+							if trade, ok := tc.Get(intent.Symbol); ok {
+								entryPrice = trade.EntryPrice
+							}
+							tg.NotifySell(score.Symbol, strat.ID(), intent.Reason, intent.Quantity, intent.Price, entryPrice, resp.OrderID)
+						}
 
 						// IMPORTANT FIX: Do NOT close trade immediately. Store exit order ID and let monitor_exits
 						// check order status and use actual fill price when closing (prevents 0 P&L issue).
@@ -1107,6 +1127,11 @@ func registerMarketJobs(
 						logTradeAction(ctx, store, logger, "EXIT_PLACED", "ORDER_PLACED",
 							fmt.Sprintf("order=%s qty=%d price=%.2f reason=%s", resp.OrderID, intent.Quantity, intent.Price, intent.Reason),
 							intent, string(regime.Regime))
+
+						if tg != nil {
+							entryPrice := h.AveragePrice
+							tg.NotifySell(h.Symbol, strat.ID(), intent.Reason, intent.Quantity, intent.Price, entryPrice, resp.OrderID)
+						}
 
 						// IMPORTANT FIX: Do NOT close trade immediately. Store exit order for status monitoring.
 						if tc != nil {
@@ -2215,6 +2240,7 @@ func registerPostbackHandler(
 	cb *risk.CircuitBreaker,
 	cfg *config.Config,
 	logger *log.Logger,
+	tg *notify.Telegram,
 ) {
 	if whServer == nil {
 		return
@@ -2261,6 +2287,9 @@ func registerPostbackHandler(
 					exitPrice := u.AveragePrice
 					if exitPrice == 0 {
 						exitPrice = trade.StopLoss
+					}
+					if tg != nil {
+						tg.NotifySLTriggered(sym, trade.Quantity, exitPrice, trade.EntryPrice)
 					}
 					if store != nil {
 						if err := store.CloseTrade(ctx, trade.ID, exitPrice, "stop_loss"); err != nil {

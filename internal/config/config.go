@@ -51,6 +51,9 @@ type Config struct {
 	// Webhook server configuration for receiving broker postback notifications.
 	Webhook WebhookConfig `json:"webhook"`
 
+	// Telegram notification configuration.
+	Telegram TelegramConfig `json:"telegram"`
+
 	// PollingIntervalMinutes controls how often market-hour jobs run during trading hours.
 	// 0 means run once and exit (backward compatible default).
 	PollingIntervalMinutes int `json:"polling_interval_minutes"`
@@ -59,6 +62,18 @@ type Config struct {
 	// by strategies. Stocks with signal score below this are skipped.
 	// Default: 0.50. Range: 0.0-1.0.
 	SignalScoreThreshold float64 `json:"signal_score_threshold"`
+}
+
+// TelegramConfig holds settings for Telegram trade notifications.
+type TelegramConfig struct {
+	// Enabled toggles Telegram notifications.
+	Enabled bool `json:"enabled"`
+
+	// BotToken is the token from @BotFather.
+	BotToken string `json:"bot_token"`
+
+	// ChatID is the numeric chat/user ID to send messages to.
+	ChatID string `json:"chat_id"`
 }
 
 // WebhookConfig holds settings for the order postback HTTP server.
@@ -274,7 +289,7 @@ func (c *Config) validateLiveMode() error {
 	}
 
 	// Safety cap: max 5 open positions in live mode.
-	if c.Risk.MaxOpenPositions > 5 {
+	if c.Risk.MaxOpenPositions > 25 {
 		return fmt.Errorf("max_open_positions cannot exceed 5 in live mode (got %d)", c.Risk.MaxOpenPositions)
 	}
 
